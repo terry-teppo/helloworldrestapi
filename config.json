@@ -1,0 +1,50 @@
+{
+  "server": {
+    "platform": "auto",
+    "port": 8443,
+    "expected_app_secret": "replace_with_secure_random_value",
+    "expected_aud": "your-api-audience",
+    "expected_app_id": "your-app-id",
+    "userdata_file": "users.bin",
+    "pubkey_file": "public.pem",
+    "app_pubkey_file": "app_pub.pem",
+    "cleanup_interval_seconds": 60,
+    "jwks_refresh_interval": 3600,
+    "max_requests_per_minute": 30,
+    "max_timestamp_drift": 300,
+    "max_nonce_entries": 10000,
+    "max_api_version_len": 15
+  },
+  "providers": [
+    {
+      "name": "google",
+      "iss": "accounts.google.com",
+      "jwks_url": "https://www.googleapis.com/oauth2/v3/certs",
+      "expected_aud": "YOUR_GOOGLE_CLIENT_ID"
+    },
+    {
+      "name": "microsoft",
+      "iss": "login.microsoftonline.com",
+      "jwks_url": "https://login.microsoftonline.com/common/discovery/v2.0/keys",
+      "expected_aud": "YOUR_MICROSOFT_APP_ID"
+    },
+    {
+      "name": "auth0",
+      "iss": "https://YOUR_DOMAIN.auth0.com/",
+      "jwks_url": "https://YOUR_DOMAIN.auth0.com/.well-known/jwks.json",
+      "expected_aud": "YOUR_AUTH0_CLIENT_ID"
+    },
+    {
+      "name": "okta",
+      "iss": "https://YOUR_OKTA_DOMAIN/oauth2/default",
+      "jwks_url": "https://YOUR_OKTA_DOMAIN/oauth2/default/v1/keys",
+      "expected_aud": "YOUR_OKTA_CLIENT_ID"
+    },
+    {
+      "name": "apple",
+      "iss": "https://appleid.apple.com",
+      "jwks_url": "https://appleid.apple.com/auth/keys",
+      "expected_aud": "YOUR_APPLE_APP_ID"
+    }
+  ]
+}
