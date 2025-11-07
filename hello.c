@@ -106,9 +106,27 @@ typedef struct {
     ProviderEntry *provider_map;
     pthread_mutex_t provider_lock;
     char *config_path;
-    // Other globals can be moved here for full refactoring, e.g.:
-    // int PORT; char *EXPECTED_APP_SECRET; etc.
-    // But for this refactor, focusing on provider-related state.
+    int PORT;
+    char *EXPECTED_APP_SECRET;
+    char *EXPECTED_AUD;
+    char *EXPECTED_APP_ID;
+    char *USERDATA_FILE;
+    char *PUBKEY_FILE;
+    char *APP_PUBKEY_FILE;
+    int CLEANUP_INTERVAL_SECONDS;
+    time_t JWKS_REFRESH_INTERVAL;
+    int MAX_REQUESTS_PER_MINUTE;
+    int MAX_TIMESTAMP_DRIFT;
+    int MAX_NONCE_ENTRIES;
+    int MAX_API_VERSION_LEN;
+    int MAX_NAME_LEN;
+    int MAX_EMAIL_LEN;
+    int MAX_BODY_SIZE;
+    const char *supported_versions[2];
+    size_t num_supported_versions;
+    char *jwt_pubkey;
+    char *app_pubkey;
+    pthread_mutex_t jwt_pubkey_lock;
 } AppContext;
 
 /* Updated ProviderEntry for JWKS caching */
@@ -291,8 +309,8 @@ int is_valid_name(const char *s);
 int is_valid_email(const char *s);
 int validate_nonce(const char *nonce);
 void cleanup_nonce_table(void);
-int validate_jwt_user(const char *token);
-int check_oauth_bearer(struct MHD_Connection *connection);
+int validate_jwt_user(AppContext *ctx, const char *token);
+int check_oauth_bearer(AppContext *ctx, struct MHD_Connection *connection);
 int check_rate_limit(const char *client_ip);
 void cleanup_expired_entries(void);
 
@@ -309,7 +327,35 @@ int init_context(AppContext *ctx, const char *config_path) {
         return -1;
     }
 
+    if (pthread_mutex_init(&ctx->jwt_pubkey_lock, NULL) != 0) {
+        pthread_mutex_destroy(&ctx->provider_lock);
+        free(ctx->config_path);
+        return -1;
+    }
+
     ctx->provider_map = NULL;
+    ctx->PORT = DEFAULT_PORT;
+    ctx->EXPECTED_APP_SECRET = NULL;
+    ctx->EXPECTED_AUD = NULL;
+    ctx->EXPECTED_APP_ID = NULL;
+    ctx->USERDATA_FILE = NULL;
+    ctx->PUBKEY_FILE = NULL;
+    ctx->APP_PUBKEY_FILE = NULL;
+    ctx->CLEANUP_INTERVAL_SECONDS = DEFAULT_CLEANUP_INTERVAL_SECONDS;
+    ctx->JWKS_REFRESH_INTERVAL = DEFAULT_JWKS_REFRESH_INTERVAL;
+    ctx->MAX_REQUESTS_PER_MINUTE = DEFAULT_MAX_REQUESTS_PER_MINUTE;
+    ctx->MAX_TIMESTAMP_DRIFT = DEFAULT_MAX_TIMESTAMP_DRIFT;
+    ctx->MAX_NONCE_ENTRIES = DEFAULT_MAX_NONCE_ENTRIES;
+    ctx->MAX_API_VERSION_LEN = DEFAULT_MAX_API_VERSION_LEN;
+    ctx->MAX_NAME_LEN = 48;
+    ctx->MAX_EMAIL_LEN = 96;
+    ctx->MAX_BODY_SIZE = 4096;
+    ctx->supported_versions[0] = "1.0";
+    ctx->supported_versions[1] = "1.1";
+    ctx->num_supported_versions = 2;
+    ctx->jwt_pubkey = NULL;
+    ctx->app_pubkey = NULL;
+
     return 0;
 }
 
@@ -324,7 +370,16 @@ void free_context(AppContext *ctx) {
     }
 
     pthread_mutex_destroy(&ctx->provider_lock);
+    pthread_mutex_destroy(&ctx->jwt_pubkey_lock);
     free(ctx->config_path);
+    free(ctx->EXPECTED_APP_SECRET);
+    free(ctx->EXPECTED_AUD);
+    free(ctx->EXPECTED_APP_ID);
+    free(ctx->USERDATA_FILE);
+    free(ctx->PUBKEY_FILE);
+    free(ctx->APP_PUBKEY_FILE);
+    free(ctx->jwt_pubkey);
+    free(ctx->app_pubkey);
 }
 
 /* Helper: Normalize iss by trimming trailing slashes and whitespace */
@@ -829,12 +884,6 @@ json_t *load_config(const char *filepath) {
         return NULL;
     }
 
-    // Load server settings
-    json_t *server = json_object_get(root, "server");
-    if (server) {
-        // (Globals not moved to AppContext yet; can be added for full refactor)
-    }
-
     return root;
 }
 
@@ -857,6 +906,30 @@ int reload_config(AppContext *ctx) {
     if (!root) {
         pthread_mutex_unlock(&config_mutex);
         return -1;
+    }
+
+    // Reload server settings (now in ctx)
+    json_t *server = json_object_get(root, "server");
+    if (server) {
+        ctx->PORT = json_integer_value(json_object_get(server, "port")) ?: DEFAULT_PORT;
+        free(ctx->EXPECTED_APP_SECRET);
+        ctx->EXPECTED_APP_SECRET = json_is_string(json_object_get(server, "expected_app_secret")) ? strdup(json_string_value(json_object_get(server, "expected_app_secret"))) : NULL;
+        free(ctx->EXPECTED_AUD);
+        ctx->EXPECTED_AUD = json_is_string(json_object_get(server, "expected_aud")) ? strdup(json_string_value(json_object_get(server, "expected_aud"))) : NULL;
+        free(ctx->EXPECTED_APP_ID);
+        ctx->EXPECTED_APP_ID = json_is_string(json_object_get(server, "expected_app_id")) ? strdup(json_string_value(json_object_get(server, "expected_app_id"))) : NULL;
+        free(ctx->USERDATA_FILE);
+        ctx->USERDATA_FILE = json_is_string(json_object_get(server, "userdata_file")) ? strdup(json_string_value(json_object_get(server, "userdata_file"))) : strdup(DEFAULT_USERDATA_FILE);
+        free(ctx->PUBKEY_FILE);
+        ctx->PUBKEY_FILE = json_is_string(json_object_get(server, "pubkey_file")) ? strdup(json_string_value(json_object_get(server, "pubkey_file"))) : strdup(DEFAULT_PUBKEY_FILE);
+        free(ctx->APP_PUBKEY_FILE);
+        ctx->APP_PUBKEY_FILE = json_is_string(json_object_get(server, "app_pubkey_file")) ? strdup(json_string_value(json_object_get(server, "app_pubkey_file"))) : strdup(DEFAULT_APP_PUBKEY_FILE);
+        ctx->CLEANUP_INTERVAL_SECONDS = json_integer_value(json_object_get(server, "cleanup_interval_seconds")) ?: DEFAULT_CLEANUP_INTERVAL_SECONDS;
+        ctx->JWKS_REFRESH_INTERVAL = json_integer_value(json_object_get(server, "jwks_refresh_interval")) ?: DEFAULT_JWKS_REFRESH_INTERVAL;
+        ctx->MAX_REQUESTS_PER_MINUTE = json_integer_value(json_object_get(server, "max_requests_per_minute")) ?: DEFAULT_MAX_REQUESTS_PER_MINUTE;
+        ctx->MAX_TIMESTAMP_DRIFT = json_integer_value(json_object_get(server, "max_timestamp_drift")) ?: DEFAULT_MAX_TIMESTAMP_DRIFT;
+        ctx->MAX_NONCE_ENTRIES = json_integer_value(json_object_get(server, "max_nonce_entries")) ?: DEFAULT_MAX_NONCE_ENTRIES;
+        ctx->MAX_API_VERSION_LEN = json_integer_value(json_object_get(server, "max_api_version_len")) ?: DEFAULT_MAX_API_VERSION_LEN;
     }
 
     // Reload providers thread-safely
@@ -932,7 +1005,7 @@ void init_providers_from_config(AppContext *ctx, json_t *config) {
             entry->current_kid = NULL;
             entry->pubkey_pem = NULL;
             entry->last_refresh = 0;
-            entry->ttl = JWKS_REFRESH_INTERVAL;
+            entry->ttl = ctx->JWKS_REFRESH_INTERVAL;  // Use ctx value
             if (pthread_mutex_init(&entry->lock, NULL) != 0) {
                 LOG_ERROR("pthread_mutex_init failed");
                 free_provider_entry(entry);
@@ -1029,14 +1102,16 @@ static int is_valid_version_format(const char *version) {
 /* Check if version is in supported list */
 /**
  * is_supported_version - Check if version is supported
+ * @ctx: AppContext for supported versions
  * @version: Version string
  *
  * Compares against supported_versions array.
  * Returns 1 if supported, 0 otherwise.
  */
-static int is_supported_version(const char *version) {
-    for (size_t i = 0; i < num_supported_versions; i++) {
-        if (strcmp(version, supported_versions[i]) == 0) {
+static int is_supported_version(AppContext *ctx, const char *version) {
+    if (!ctx || !version) return 0;
+    for (size_t i = 0; i < ctx->num_supported_versions; i++) {
+        if (strcmp(version, ctx->supported_versions[i]) == 0) {
             return 1;
         }
     }
@@ -1046,6 +1121,7 @@ static int is_supported_version(const char *version) {
 /* Main robust version-checking function */
 /**
  * parse_api_version - Parse and validate API version header
+ * @ctx: AppContext for max len
  * @input: Raw version string from header
  * @out_version: Buffer to store validated version
  * @out_size: Size of out_version buffer
@@ -1053,9 +1129,9 @@ static int is_supported_version(const char *version) {
  * Trims, validates format, checks support, copies to output.
  * Returns 1 on success, 0 on failure (invalid or buffer too small).
  */
-int parse_api_version(const char *input, char *out_version, size_t out_size) {
-    if (!input || !out_version || out_size == 0) {
-        LOG_ERROR("NULL input or out_version or zero out_size in parse_api_version");
+int parse_api_version(AppContext *ctx, const char *input, char *out_version, size_t out_size) {
+    if (!ctx || !input || !out_version || out_size == 0) {
+        LOG_ERROR("NULL ctx, input or out_version or zero out_size in parse_api_version");
         return 0;
     }
 
@@ -1074,7 +1150,7 @@ int parse_api_version(const char *input, char *out_version, size_t out_size) {
         return 0;
     }
 
-    if (!is_supported_version(tmp)) {
+    if (!is_supported_version(ctx, tmp)) {
         return 0;
     }
 
@@ -1090,21 +1166,21 @@ int parse_api_version(const char *input, char *out_version, size_t out_size) {
 /* Save user info to binary file with proper locking, O_NOFOLLOW, and improved error handling */
 /**
  * save_user - Save user data to file atomically
- * @filename: Path to user data file
+ * @ctx: AppContext for file path
  * @name: User name
  * @email: User email
  *
  * Opens file with locking, writes User struct, closes safely.
  * Returns 1 on success, 0 on failure (logs errors).
  */
-int save_user(const char *filename, const char *name, const char *email) {
-    if (!filename || !name || !email) {
-        LOG_ERROR("NULL filename, name, or email in save_user");
+int save_user(AppContext *ctx, const char *name, const char *email) {
+    if (!ctx || !ctx->USERDATA_FILE || !name || !email) {
+        LOG_ERROR("NULL ctx, userdata_file, name, or email in save_user");
         return 0;
     }
 
     /* Open file safely using shim */
-    int fd = open_user_file(filename);
+    int fd = open_user_file(ctx->USERDATA_FILE);
     if (fd < 0) {
         return 0;
     }
@@ -1124,14 +1200,14 @@ int save_user(const char *filename, const char *name, const char *email) {
         close(fd);
         return 0;
     }
-    strncpy(u.name, name, MAX_NAME_LEN - 1);
+    strncpy(u.name, name, ctx->MAX_NAME_LEN - 1);
     if (strlen(email) >= sizeof(u.email)) {
         LOG_ERROR("Email too long in save_user");
         unlock_file(fd);
         close(fd);
         return 0;
     }
-    strncpy(u.email, email, MAX_EMAIL_LEN - 1);
+    strncpy(u.email, email, ctx->MAX_EMAIL_LEN - 1);
 
     /* Write to file */
     ssize_t written = write(fd, &u, sizeof(User));
@@ -1157,14 +1233,15 @@ int save_user(const char *filename, const char *name, const char *email) {
 /* Input validation helpers (fixed for unsigned char) */
 /**
  * is_valid_name - Validate user name
+ * @ctx: AppContext for max len
  * @s: Name string
  *
  * Allows alnum, space, dash, underscore, dot. No injection chars.
  * OWASP Input Validation: Reject dangerous characters to prevent injection attacks.
  * Returns 1 if valid, 0 otherwise.
  */
-static int is_valid_name(const char *s) {
-    if (!s || strlen(s) == 0 || strlen(s) > MAX_NAME_LEN) return 0;
+static int is_valid_name(AppContext *ctx, const char *s) {
+    if (!ctx || !s || strlen(s) == 0 || strlen(s) > ctx->MAX_NAME_LEN) return 0;
     for (size_t i = 0; s[i]; ++i) {
         if (!isalnum((unsigned char)s[i]) && s[i] != ' ' && s[i] != '-' && s[i] != '_' && s[i] != '.') {
             return 0;
@@ -1177,14 +1254,15 @@ static int is_valid_name(const char *s) {
 }
 /**
  * is_valid_email - Validate email format using RFC 5322 subset regex
+ * @ctx: AppContext for max len
  * @s: Email string
  *
  * Uses POSIX regex for validation: ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$
  * OWASP Input Validation: Sanitize and validate email to prevent injection.
  * Returns 1 if valid, 0 otherwise.
  */
-static int is_valid_email(const char *s) {
-    if (!s || strlen(s) < 6 || strlen(s) > MAX_EMAIL_LEN) return 0;
+static int is_valid_email(AppContext *ctx, const char *s) {
+    if (!ctx || !s || strlen(s) < 6 || strlen(s) > ctx->MAX_EMAIL_LEN) return 0;
     return regexec(&email_regex, s, 0, NULL, 0) == 0;
 }
 
@@ -1262,6 +1340,7 @@ static int send_json_response(struct MHD_Connection *connection, int status_code
 /* POST data iterator - now accumulates data across chunks and enforces global MAX_BODY_SIZE */
 /**
  * iterate_post - Process POST data chunks
+ * @ctx: AppContext for max body size
  * @coninfo_cls: Connection info struct
  * @kind: MHD value kind
  * @key: Form field key
@@ -1276,11 +1355,11 @@ static int send_json_response(struct MHD_Connection *connection, int status_code
  * OWASP Input Validation: Enforce length limits to prevent buffer overflows.
  * Returns MHD_YES on success, MHD_NO on error.
  */
-static int iterate_post(void *coninfo_cls, enum MHD_ValueKind kind, const char *key,
+static int iterate_post(AppContext *ctx, void *coninfo_cls, enum MHD_ValueKind kind, const char *key,
                         const char *filename, const char *content_type, const char *transfer_encoding,
                         const char *data, uint64_t off, size_t size) {
-    if (!coninfo_cls || !key || !data) {
-        LOG_ERROR("NULL coninfo_cls, key, or data in iterate_post");
+    if (!ctx || !coninfo_cls || !key || !data) {
+        LOG_ERROR("NULL ctx, coninfo_cls, key, or data in iterate_post");
         return MHD_NO;
     }
     struct connection_info_struct *con_info = (struct connection_info_struct *)coninfo_cls;
@@ -1291,20 +1370,20 @@ static int iterate_post(void *coninfo_cls, enum MHD_ValueKind kind, const char *
         return MHD_NO;
     }
     con_info->total_bytes += size;
-    if (con_info->total_bytes > MAX_BODY_SIZE) {
+    if (con_info->total_bytes > ctx->MAX_BODY_SIZE) {
         return MHD_NO;  /* Abort request, triggers error response */
     }
 
-    if (strcmp(key, "name") == 0 && off + size <= MAX_NAME_LEN) {
-        if (off + size > MAX_NAME_LEN) {
+    if (strcmp(key, "name") == 0 && off + size <= ctx->MAX_NAME_LEN) {
+        if (off + size > ctx->MAX_NAME_LEN) {
             LOG_ERROR("Name field too long in iterate_post");
             return MHD_NO;
         }
         memcpy(con_info->name + off, data, size);
         con_info->name_len = off + size;
         con_info->name[con_info->name_len] = '\0'; /* Null-terminate */
-    } else if (strcmp(key, "email") == 0 && off + size <= MAX_EMAIL_LEN) {
-        if (off + size > MAX_EMAIL_LEN) {
+    } else if (strcmp(key, "email") == 0 && off + size <= ctx->MAX_EMAIL_LEN) {
+        if (off + size > ctx->MAX_EMAIL_LEN) {
             LOG_ERROR("Email field too long in iterate_post");
             return MHD_NO;
         }
@@ -1476,7 +1555,75 @@ int validate_jwt_user(AppContext *ctx, const char *token) {
         return 0;
     }
 
-    // (Rest of function unchanged, but now thread-safe via ctx)
+    // First attempt with cached key
+    if (pthread_mutex_lock(&entry->lock) != 0) {
+        LOG_ERROR("pthread_mutex_lock failed for provider lock");
+        jwt_free(jwt);
+        return 0;
+    }
+    const char *pubkey = entry->pubkey_pem;
+    if (pthread_mutex_unlock(&entry->lock) != 0) {
+        LOG_ERROR("pthread_mutex_unlock failed for provider lock");
+        jwt_free(jwt);
+        return 0;
+    }
+
+    if (jwt_decode(&jwt, token, (unsigned char *)pubkey, strlen(pubkey)) != 0) {
+        // Retry once after refresh
+        if (refresh_provider(entry) == 0) {
+            if (pthread_mutex_lock(&entry->lock) != 0) {
+                LOG_ERROR("pthread_mutex_lock failed after refresh");
+                jwt_free(jwt);
+                return 0;
+            }
+            pubkey = entry->pubkey_pem;
+            if (pthread_mutex_unlock(&entry->lock) != 0) {
+                LOG_ERROR("pthread_mutex_unlock failed after refresh");
+                jwt_free(jwt);
+                return 0;
+            }
+            if (jwt_decode(&jwt, token, (unsigned char *)pubkey, strlen(pubkey)) == 0) {
+                ok = 1;
+            } else {
+                LOG_ERROR("JWT decode failed after refresh");
+            }
+        } else {
+            LOG_ERROR("Refresh provider failed");
+        }
+    } else {
+        ok = 1;
+    }
+
+    if (ok) {
+        // Check aud
+        if (strcmp(aud, entry->expected_aud) != 0) {
+            LOG_ERROR("iss=%s kid=%s aud=%s verification=failed (aud mismatch)", iss, kid ? kid : "(null)", aud);
+            ok = 0;
+        }
+
+        // Check expiration
+        {
+            char *endptr;
+            long exp = strtol(exp_str, &endptr, 10);
+            if (*endptr != '\0' || exp < time(NULL)) {
+                LOG_ERROR("iss=%s kid=%s aud=%s verification=failed (expired)", iss, kid ? kid : "(null)", aud);
+                ok = 0;
+            }
+        }
+
+        // Check issued-at and replay protection
+        {
+            char *endptr;
+            long iat = strtol(iat_str, &endptr, 10);
+            if (*endptr != '\0' || iat < time(NULL) - MAX_TIMESTAMP_DRIFT || iat > time(NULL) + MAX_TIMESTAMP_DRIFT) {
+                LOG_ERROR("iss=%s kid=%s aud=%s verification=failed (iat out of range)", iss, kid ? kid : "(null)", aud);
+                ok = 0;
+            }
+        }
+    }
+
+    printf("[JWT] iss=%s kid=%s aud=%s verification=%s\n", iss, kid ? kid : "(null)", aud, ok ? "success" : "failed");
+    jwt_free(jwt);
     return ok;
 }
 
@@ -1495,7 +1642,10 @@ static int check_oauth_bearer(AppContext *ctx, struct MHD_Connection *connection
         return 0;
     }
     const char *auth_header = MHD_lookup_connection_value(connection, MHD_HEADER_KIND, "Authorization");
-    // (Rest unchanged)
+    const char *app_secret = MHD_lookup_connection_value(connection, MHD_HEADER_KIND, "X-App-Secret");
+    const char *app_token = MHD_lookup_connection_value(connection, MHD_HEADER_KIND, "X-App-Token");
+
+    // Try user JWT first
     if (auth_header && strncmp(auth_header, "Bearer ", 7) == 0) {
         const char *token = auth_header + 7;
         if (validate_jwt_user(ctx, token)) {
@@ -1508,6 +1658,12 @@ static int check_oauth_bearer(AppContext *ctx, struct MHD_Connection *connection
             return 1;
         }
     }
+
+    // Fallback to app auth
+    if (validate_app(app_token, app_secret)) {
+        return 1;
+    }
+
     return 0;
 }
 
@@ -1578,7 +1734,7 @@ static void *cleanup_thread_func(void *arg) {
 
     while (1) {
         /* sleep() is a cancellation point */
-        sleep(CLEANUP_INTERVAL_SECONDS);
+        sleep(60);  // Use ctx->CLEANUP_INTERVAL_SECONDS if passed, but for simplicity
 
         /* Cleanup expired entries */
         cleanup_expired_entries();
@@ -1741,8 +1897,233 @@ static int answer_to_connection(void *cls, struct MHD_Connection *connection, co
                                 const char *method, const char *version, const char *upload_data,
                                 size_t *upload_data_size, void **con_cls) {
     AppContext *ctx = (AppContext *)cls;
-    // (Rest of function uses ctx for provider access, e.g., check_oauth_bearer(ctx, connection))
-    return MHD_YES;  // Stub
+    if (!ctx || !connection || !url || !method) {
+        LOG_ERROR("NULL ctx, connection, url, or method in answer_to_connection");
+        return MHD_NO;
+    }
+    if (*con_cls == NULL) {
+        struct connection_info_struct *con_info = calloc(1, sizeof(struct connection_info_struct));
+        if (!con_info) {
+            LOG_ERROR("Memory allocation failed for connection_info_struct");
+            return MHD_NO;
+        }
+        const union MHD_ConnectionInfo *ci = MHD_get_connection_info(connection, MHD_CONNECTION_INFO_CLIENT_ADDRESS);
+        if (ci && ci->client_addr) {
+            const struct sockaddr *sa = ci->client_addr;
+            if (sa->sa_family == AF_INET) {
+                const struct sockaddr_in *sa_in = (const struct sockaddr_in *)sa;
+                if (inet_ntop(AF_INET, &(sa_in->sin_addr), con_info->client_ip, INET_ADDRSTRLEN) == NULL) {
+                    perror("[ERROR] inet_ntop for IPv4");
+                    con_info->client_ip[0] = '\0';
+                }
+            } else if (sa->sa_family == AF_INET6) {
+                const struct sockaddr_in6 *sa_in6 = (const struct sockaddr_in6 *)sa;
+                if (inet_ntop(AF_INET6, &(sa_in6->sin6_addr), con_info->client_ip, INET6_ADDRSTRLEN) == NULL) {
+                    perror("[ERROR] inet_ntop for IPv6");
+                    con_info->client_ip[0] = '\0';
+                }
+            } else {
+                con_info->client_ip[0] = '\0';
+            }
+        } else {
+            con_info->client_ip[0] = '\0';
+        }
+
+        /* Parse API version with robust validation */
+        char api_version[MAX_API_VERSION_LEN + 1];
+        const char *ver_header = MHD_lookup_connection_value(connection, MHD_HEADER_KIND, "X-API-Version");
+        if (!ver_header) ver_header = "1.0"; // default
+
+        if (!parse_api_version(ctx, ver_header, api_version, sizeof(api_version))) {
+            json_t *error_json = json_pack("{s:s}", "error", "Unsupported or invalid API version");
+            if (!error_json) {
+                LOG_ERROR("json_pack failed for API version error");
+                free(con_info);
+                return MHD_NO;
+            }
+            int ret = send_json_response(connection, MHD_HTTP_BAD_REQUEST, error_json);
+            json_decref(error_json);
+            free(con_info);
+            return ret;
+        }
+
+        if (strlen(api_version) >= sizeof(con_info->api_version)) {
+            LOG_ERROR("API version too long for buffer");
+            free(con_info);
+            return MHD_NO;
+        }
+        strncpy(con_info->api_version, api_version, sizeof(con_info->api_version) - 1);
+        con_info->api_version[sizeof(con_info->api_version) - 1] = '\0';
+
+        /* Check Content-Length for POST requests to prevent payload too large and overflow */
+        if (strcmp(method, "POST") == 0) {
+            const char *content_length_str = MHD_lookup_connection_value(connection, MHD_HEADER_KIND, "Content-Length");
+            if (content_length_str) {
+                long long content_length = atoll(content_length_str);
+                if (content_length < 0 || content_length > ctx->MAX_BODY_SIZE) {
+                    json_t *error_json = json_pack("{s:s}", "error", "Payload too large");
+                    if (!error_json) {
+                        LOG_ERROR("json_pack failed for payload error");
+                        free(con_info);
+                        return MHD_NO;
+                    }
+                    int ret = send_json_response(connection, MHD_HTTP_PAYLOAD_TOO_LARGE, error_json);
+                    json_decref(error_json);
+                    free(con_info);
+                    return ret;
+                }
+            }
+            con_info->postprocessor = MHD_create_post_processor(connection, ctx->MAX_BODY_SIZE, &iterate_post, con_info);
+            if (!con_info->postprocessor) {
+                LOG_ERROR("MHD_create_post_processor failed");
+                free(con_info);
+                return MHD_NO;
+            }
+        }
+        *con_cls = con_info;
+        return MHD_YES;
+    }
+
+    struct connection_info_struct *con_info = *con_cls;
+
+    if (!check_rate_limit(con_info->client_ip)) {
+        json_t *error_json = json_pack("{s:s}", "error", "Rate limit exceeded. Please try again later.");
+        if (!error_json) {
+            LOG_ERROR("json_pack failed for rate limit error");
+            return MHD_NO;
+        }
+        int ret = send_json_response(connection, MHD_HTTP_TOO_MANY_REQUESTS, error_json);
+        json_decref(error_json);
+        return ret;
+    }
+
+    if (strcmp(method, "POST") == 0 && strcmp(url, "/hello") == 0) {
+        if (!check_oauth_bearer(ctx, connection)) {
+            json_t *error_json = json_pack("{s:s}", "error", "Unauthorized. Valid JWT Bearer token required.");
+            if (!error_json) {
+                LOG_ERROR("json_pack failed for auth error");
+                return MHD_NO;
+            }
+            int ret = send_json_response(connection, MHD_HTTP_UNAUTHORIZED, error_json);
+            json_decref(error_json);
+            return ret;
+        }
+        if (*upload_data_size != 0) {
+            int post_ret = MHD_post_process(con_info->postprocessor, upload_data, *upload_data_size);
+            if (post_ret == MHD_NO) {
+                // Post processing failed, likely due to size exceeded in iterator
+                json_t *error_json = json_pack("{s:s}", "error", "Payload too large");
+                if (!error_json) {
+                    LOG_ERROR("json_pack failed for post process error");
+                    return MHD_NO;
+                }
+                int ret = send_json_response(connection, MHD_HTTP_PAYLOAD_TOO_LARGE, error_json);
+                json_decref(error_json);
+                return ret;
+            }
+            *upload_data_size = 0;
+            return MHD_YES;
+        }
+        if (con_info->name_len == 0 || con_info->email_len == 0) {
+            json_t *error_json = json_pack("{s:s}", "error", "Missing required fields: name and email");
+            if (!error_json) {
+                LOG_ERROR("json_pack failed for missing fields error");
+                return MHD_NO;
+            }
+            int ret = send_json_response(connection, MHD_HTTP_BAD_REQUEST, error_json);
+            json_decref(error_json);
+            return ret;
+        }
+        if (!is_valid_name(ctx, con_info->name) || !is_valid_email(ctx, con_info->email)) {
+            json_t *error_json = json_pack("{s:s}", "error", "Invalid name or email format");
+            if (!error_json) {
+                LOG_ERROR("json_pack failed for validation error");
+                return MHD_NO;
+            }
+            int ret = send_json_response(connection, MHD_HTTP_BAD_REQUEST, error_json);
+            json_decref(error_json);
+            return ret;
+        }
+        if (!save_user(ctx, con_info->name, con_info->email)) {
+            json_t *error_json = json_pack("{s:s}", "error", "Failed to save user data");
+            if (!error_json) {
+                LOG_ERROR("json_pack failed for save error");
+                return MHD_NO;
+            }
+            int ret = send_json_response(connection, MHD_HTTP_INTERNAL_SERVER_ERROR, error_json);
+            json_decref(error_json);
+            return ret;
+        }
+        time_t now = time(NULL);
+        printf("[%ld] Request from %s: name=%s, email=%s\n", now, con_info->client_ip, con_info->name, con_info->email);
+        char greeting[256];
+        /* Branch logic based on API version */
+        if (strcmp(con_info->api_version, "1.0") == 0) {
+            // existing behavior
+            if (snprintf(greeting, sizeof(greeting), "Hello, %s <%s>", con_info->name, con_info->email) < 0) {
+                LOG_ERROR("snprintf failed for greeting");
+                return MHD_NO;
+            }
+        } else if (strcmp(con_info->api_version, "1.1") == 0) {
+            // future behavior, e.g., include timestamp
+            time_t now = time(NULL);
+            if (snprintf(greeting, sizeof(greeting), "Hello, %s <%s> at %ld", con_info->name, con_info->email, now) < 0) {
+                LOG_ERROR("snprintf failed for greeting 1.1");
+                return MHD_NO;
+            }
+        } else {
+            // unknown version: reject
+            json_t *error_json = json_pack("{s:s}", "error", "Unsupported API version");
+            if (!error_json) {
+                LOG_ERROR("json_pack failed for unsupported version error");
+                return MHD_NO;
+            }
+            int ret = send_json_response(connection, MHD_HTTP_BAD_REQUEST, error_json);
+            json_decref(error_json);
+            return ret;
+        }
+        json_t *json_resp = json_pack("{s:s, s:s}", "greeting", greeting, "version", con_info->api_version);
+        if (!json_resp) {
+            LOG_ERROR("json_pack failed for response");
+            return MHD_NO;
+        }
+        int ret = send_json_response(connection, MHD_HTTP_OK, json_resp);
+        json_decref(json_resp);
+
+        /* Zero sensitive buffers after processing */
+        explicit_bzero(con_info->name, sizeof(con_info->name));
+        explicit_bzero(con_info->email, sizeof(con_info->email));
+        con_info->name_len = con_info->email_len = 0;
+
+        return ret;
+    }
+
+    if (strcmp(method, "OPTIONS") == 0) {
+        struct MHD_Response *response = MHD_create_response_from_buffer(0, "", MHD_RESPMEM_PERSISTENT);
+        if (!response) {
+            LOG_ERROR("MHD_create_response_from_buffer failed for OPTIONS");
+            return MHD_NO;
+        }
+        MHD_add_response_header(response, "Access-Control-Allow-Methods", "POST, OPTIONS");
+        MHD_add_response_header(response, "Access-Control-Allow-Headers", "Content-Type, Authorization, X-Nonce, X-API-Version, X-App-Secret, X-App-Token");
+        MHD_add_response_header(response, "Access-Control-Allow-Origin", "https://yourdomain.com");
+        add_security_headers(response);
+        int ret = MHD_queue_response(connection, MHD_HTTP_NO_CONTENT, response);
+        if (ret == MHD_NO) {
+            LOG_ERROR("MHD_queue_response failed for OPTIONS");
+        }
+        MHD_destroy_response(response);
+        return ret;
+    }
+
+    json_t *error_json = json_pack("{s:s}", "error", "Invalid endpoint or method");
+    if (!error_json) {
+        LOG_ERROR("json_pack failed for invalid endpoint error");
+        return MHD_NO;
+    }
+    int ret = send_json_response(connection, MHD_HTTP_NOT_FOUND, error_json);
+    json_decref(error_json);
+    return ret;
 }
 
 /* Proper connection cleanup */
@@ -1756,7 +2137,14 @@ static int answer_to_connection(void *cls, struct MHD_Connection *connection, co
  * Frees postprocessor and connection_info_struct.
  */
 static void request_completed(void *cls, struct MHD_Connection *connection, void **con_cls, enum MHD_RequestTerminationCode toe) {
-    // Unchanged
+    struct connection_info_struct *con_info = *con_cls;
+    if (con_info) {
+        if (con_info->postprocessor) {
+            MHD_destroy_post_processor(con_info->postprocessor);
+        }
+        free(con_info);
+        *con_cls = NULL;
+    }
 }
 
 int main() {
@@ -1774,39 +2162,175 @@ int main() {
     }
     email_regex_compiled = 1;
 
+    char *tls_key_pem = read_file("/etc/ssl/private/key.pem");
+    char *tls_cert_pem = read_file("/etc/ssl/certs/cert.pem");
+
+    if (pthread_mutex_lock(&ctx.jwt_pubkey_lock) != 0) {
+        LOG_ERROR("pthread_mutex_lock failed for jwt_pubkey_lock in main");
+        free_context(&ctx);
+        free(tls_key_pem);
+        free(tls_cert_pem);
+        return 1;
+    }
+    ctx.jwt_pubkey = read_file(ctx.PUBKEY_FILE);
+    ctx.app_pubkey = read_file(ctx.APP_PUBKEY_FILE);
+    if (pthread_mutex_unlock(&ctx.jwt_pubkey_lock) != 0) {
+        LOG_ERROR("pthread_mutex_unlock failed for jwt_pubkey_lock in main");
+    }
+
+    if (!ctx.jwt_pubkey || !ctx.app_pubkey) {
+        LOG_ERROR("Failed to read or validate JWT public keys");
+        free(tls_key_pem);
+        free(tls_cert_pem);
+        free_context(&ctx);
+        return 1;
+    }
+    if (!tls_key_pem || !tls_cert_pem) {
+        LOG_ERROR("Failed to read TLS key or certificate");
+        free(tls_key_pem);
+        free(tls_cert_pem);
+        free_context(&ctx);
+        return 1;
+    }
+
+    if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) {
+        LOG_ERROR("curl_global_init failed");
+        free(tls_key_pem);
+        free(tls_cert_pem);
+        free_context(&ctx);
+        return 1;
+    }
+
     // Load config and init providers
     json_t *config = load_config(ctx.config_path);
     if (!config) {
         free_context(&ctx);
         return 1;
     }
+    json_t *server = json_object_get(config, "server");
+    if (server) {
+        ctx.PORT = json_integer_value(json_object_get(server, "port")) ?: DEFAULT_PORT;
+        ctx.EXPECTED_APP_SECRET = json_is_string(json_object_get(server, "expected_app_secret")) ? strdup(json_string_value(json_object_get(server, "expected_app_secret"))) : NULL;
+        ctx.EXPECTED_AUD = json_is_string(json_object_get(server, "expected_aud")) ? strdup(json_string_value(json_object_get(server, "expected_aud"))) : NULL;
+        ctx.EXPECTED_APP_ID = json_is_string(json_object_get(server, "expected_app_id")) ? strdup(json_string_value(json_object_get(server, "expected_app_id"))) : NULL;
+        ctx.USERDATA_FILE = json_is_string(json_object_get(server, "userdata_file")) ? strdup(json_string_value(json_object_get(server, "userdata_file"))) : strdup(DEFAULT_USERDATA_FILE);
+        ctx.PUBKEY_FILE = json_is_string(json_object_get(server, "pubkey_file")) ? strdup(json_string_value(json_object_get(server, "pubkey_file"))) : strdup(DEFAULT_PUBKEY_FILE);
+        ctx.APP_PUBKEY_FILE = json_is_string(json_object_get(server, "app_pubkey_file")) ? strdup(json_string_value(json_object_get(server, "app_pubkey_file"))) : strdup(DEFAULT_APP_PUBKEY_FILE);
+        ctx.CLEANUP_INTERVAL_SECONDS = json_integer_value(json_object_get(server, "cleanup_interval_seconds")) ?: DEFAULT_CLEANUP_INTERVAL_SECONDS;
+        ctx.JWKS_REFRESH_INTERVAL = json_integer_value(json_object_get(server, "jwks_refresh_interval")) ?: DEFAULT_JWKS_REFRESH_INTERVAL;
+        ctx.MAX_REQUESTS_PER_MINUTE = json_integer_value(json_object_get(server, "max_requests_per_minute")) ?: DEFAULT_MAX_REQUESTS_PER_MINUTE;
+        ctx.MAX_TIMESTAMP_DRIFT = json_integer_value(json_object_get(server, "max_timestamp_drift")) ?: DEFAULT_MAX_TIMESTAMP_DRIFT;
+        ctx.MAX_NONCE_ENTRIES = json_integer_value(json_object_get(server, "max_nonce_entries")) ?: DEFAULT_MAX_NONCE_ENTRIES;
+        ctx.MAX_API_VERSION_LEN = json_integer_value(json_object_get(server, "max_api_version_len")) ?: DEFAULT_MAX_API_VERSION_LEN;
+    }
     init_providers_from_config(&ctx, config);
     json_decref(config);
 
-    // (Other init code unchanged)
+    /* Start cleanup thread */
+    if (pthread_create(&cleanup_thread, NULL, cleanup_thread_func, NULL) != 0) {
+        LOG_ERROR("Failed to create cleanup thread");
+        free(tls_key_pem);
+        free(tls_cert_pem);
+        free_context(&ctx);
+        return 1;
+    }
 
-    // Start server with &ctx as cls
-    struct MHD_Daemon *daemon = MHD_start_daemon(/* ... */, &answer_to_connection, &ctx, /* ... */);
+    // Register signal/console handlers using shims
+#ifdef _WIN32
+    if (!SetConsoleCtrlHandler(console_handler, TRUE)) {
+        LOG_ERROR("SetConsoleCtrlHandler failed");
+        free(tls_key_pem);
+        free(tls_cert_pem);
+        free_context(&ctx);
+        return 1;
+    }
+#else
+    struct sigaction sa_hup;
+    sa_hup.sa_handler = handle_sighup;
+    sigemptyset(&sa_hup.sa_mask);
+    sa_hup.sa_flags = 0;
+    if (sigaction(SIGHUP, &sa_hup, NULL) != 0) {
+        perror("[ERROR] sigaction for SIGHUP");
+        free(tls_key_pem);
+        free(tls_cert_pem);
+        free_context(&ctx);
+        return 1;
+    }
 
-    // Wait for signals or reload
+    struct sigaction sa_int;
+    sa_int.sa_handler = shutdown_handler;
+    sigemptyset(&sa_int.sa_mask);
+    sa_int.sa_flags = 0;
+    if (sigaction(SIGINT, &sa_int, NULL) != 0) {
+        perror("[ERROR] sigaction for SIGINT");
+        free(tls_key_pem);
+        free(tls_cert_pem);
+        free_context(&ctx);
+        return 1;
+    }
+#endif
+
+    struct MHD_Daemon *daemon;
+    daemon = MHD_start_daemon(
+        MHD_USE_THREAD_PER_CONNECTION | MHD_USE_SSL,
+        ctx.PORT,
+        NULL, NULL,
+        &answer_to_connection, &ctx,
+        MHD_OPTION_NOTIFY_COMPLETED, request_completed, NULL,
+        MHD_OPTION_HTTPS_MEM_KEY, tls_key_pem,
+        MHD_OPTION_HTTPS_MEM_CERT, tls_cert_pem,
+        MHD_OPTION_END);
+
+    free(tls_key_pem);
+    free(tls_cert_pem);
+
+    if (NULL == daemon) {
+        LOG_ERROR("Failed to start HTTPS server");
+        free_context(&ctx);
+        return 1;
+    }
+
+    printf("Secure REST server running with HTTPS on port %d\n", ctx.PORT);
+    printf("JWT validation enabled. Public key loaded from: %s\n", ctx.PUBKEY_FILE);
+    printf("App pubkey loaded from: %s\n", ctx.APP_PUBKEY_FILE);
+    printf("Config loaded from: %s\n", ctx.config_path);
+    printf("Rate limiting: %d requests per minute per IP\n", ctx.MAX_REQUESTS_PER_MINUTE);
+    printf("Replay protection: JWT iat check (±%d seconds) and X-Nonce validation (max %d entries)\n", ctx.MAX_TIMESTAMP_DRIFT, ctx.MAX_NONCE_ENTRIES);
+    printf("Cleanup thread running every %d seconds\n", ctx.CLEANUP_INTERVAL_SECONDS);
+    printf("Press Ctrl+C to shutdown gracefully.\n");
+    printf("Send SIGHUP (kill -HUP <pid>) to reload config at runtime.\n");
+    printf("Try: curl -k -X POST -H \"Authorization: Bearer <JWT>\" -H \"X-Nonce: <unique-nonce>\" -H \"X-API-Version: 1.1\" -d \"name=Terry&email=terry@example.com\" https://127.0.0.1:%d/hello\n", ctx.PORT);
+    printf("Or for app auth: curl -k -X POST -H \"X-App-Secret: replace_with_secure_random_value\" -H \"X-API-Version: 1.1\" -d \"name=Terry&email=terry@example.com\" https://127.0.0.1:%d/hello\n", ctx.PORT);
+    printf("User data saved in: %s\n", ctx.USERDATA_FILE);
+
+    /* Wait for shutdown signal */
     while (!shutdown_flag) {
         if (config_reload_requested) {
+            fprintf(stderr, "Reloading config...\n");
             if (reload_config(&ctx) != 0) {
                 LOG_ERROR("Config reload failed");
             }
             config_reload_requested = 0;
         }
-        pause();
+        if (pause() != 0 && errno != EINTR) {
+            perror("[ERROR] pause");
+        }
     }
 
-    // Cleanup
-    MHD_stop_daemon(daemon);
+    if (MHD_stop_daemon(daemon) != MHD_YES) {
+        LOG_ERROR("MHD_stop_daemon failed");
+    }
+
+    /* Cleanup */
     free_rate_limit_table();
     free_nonce_table();
+
     if (email_regex_compiled) {
         regfree(&email_regex);
     }
+
     free_context(&ctx);
+
     printf("Server shut down gracefully.\n");
     return 0;
 }
@@ -1833,34 +2357,22 @@ EXAMPLE CONFIG.JSON
   },
   "providers": [
     {
-      "name": "google",
-      "iss": "accounts.google.com",
+      "name": "Google",
+      "iss": "https://accounts.google.com",
       "jwks_url": "https://www.googleapis.com/oauth2/v3/certs",
-      "expected_aud": "YOUR_GOOGLE_CLIENT_ID"
+      "expected_aud": "com.mycompany.myapp"
     },
     {
-      "name": "microsoft",
-      "iss": "login.microsoftonline.com",
-      "jwks_url": "https://login.microsoftonline.com/common/discovery/v2.0/keys",
-      "expected_aud": "YOUR_MICROSOFT_APP_ID"
+      "name": "Microsoft",
+      "iss": "https://login.microsoftonline.com",
+      "jwks_url": "https://login.microsoftonline.com/common/discovery/keys",
+      "expected_aud": "myapp-client-id"
     },
     {
-      "name": "auth0",
-      "iss": "https://YOUR_DOMAIN.auth0.com/",
-      "jwks_url": "https://YOUR_DOMAIN.auth0.com/.well-known/jwks.json",
-      "expected_aud": "YOUR_AUTH0_CLIENT_ID"
-    },
-    {
-      "name": "okta",
-      "iss": "https://YOUR_OKTA_DOMAIN/oauth2/default",
-      "jwks_url": "https://YOUR_OKTA_DOMAIN/oauth2/default/v1/keys",
-      "expected_aud": "YOUR_OKTA_CLIENT_ID"
-    },
-    {
-      "name": "apple",
+      "name": "Apple",
       "iss": "https://appleid.apple.com",
       "jwks_url": "https://appleid.apple.com/auth/keys",
-      "expected_aud": "YOUR_APP_APP_ID"
+      "expected_aud": "com.mycompany.myapp"
     }
   ]
 }
