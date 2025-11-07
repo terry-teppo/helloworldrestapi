@@ -67,12 +67,19 @@ Config example in file comments below.
 #include <regex.h>
 
 #ifdef _WIN32
+#define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
 #include <io.h>
 #endif
 
 /* uthash for dynamic hash map */
 #include "uthash.h"
+
+/* Define User struct */
+typedef struct {
+    char name[256];  /* Adjust size as needed */
+    char email[256]; /* Adjust size as needed */
+} User;
 
 #define CONFIG_FILE "config.json"
 #define DEFAULT_PORT 8443
@@ -131,7 +138,7 @@ typedef struct {
 
 /* Updated ProviderEntry for JWKS caching */
 typedef struct {
-    const char *iss;          // issuer identifier (normalized)
+    char *iss;          // changed to char* for uthash
     const char *jwks_url;     // JWKS endpoint URL
     const char *expected_aud; // expected audience for validation
     char *current_kid;        // current key ID from JWKS
@@ -156,6 +163,21 @@ static volatile sig_atomic_t config_reload_requested = 0;
 static regex_t email_regex;
 static int email_regex_compiled = 0;
 
+/* Static functions for curl callbacks */
+static size_t curl_write_callback(char *ptr, size_t size, size_t nmemb, void *userdata) {
+    struct curl_memory *mem = (struct curl_memory *)userdata;
+    size_t realsize = size * nmemb;
+    mem->data = realloc(mem->data, mem->size + realsize + 1);
+    if (!mem->data) {
+        LOG_ERROR("realloc failed in curl write callback");
+        return 0;
+    }
+    memcpy(&(mem->data[mem->size]), ptr, realsize);
+    mem->size += realsize;
+    mem->data[mem->size] = 0;
+    return realsize;
+}
+
 /* Platform shims */
 #ifdef _WIN32
 BOOL WINAPI console_handler(DWORD signal) {
@@ -176,6 +198,15 @@ void handle_sighup(int sig) {
     config_reload_requested = 1;
 }
 #endif
+
+/* Portable secure zero */
+static void secure_zero(void *p, size_t n) {
+#ifdef _WIN32
+    SecureZeroMemory(p, n);
+#else
+    explicit_bzero(p, n);
+#endif
+}
 
 /* File locking shim */
 int lock_file(int fd) {
@@ -283,7 +314,7 @@ char *detect_platform(const char *cfg_value) {
  */
 void free_provider_entry(ProviderEntry *entry) {
     if (!entry) return;
-    free((char *)entry->iss);
+    free(entry->iss);
     free((char *)entry->jwks_url);
     free((char *)entry->expected_aud);
     free(entry->current_kid);
@@ -304,7 +335,7 @@ void trim_whitespace(char *str);
 int is_valid_version_format(const char *version);
 int is_supported_version(const char *version);
 int parse_api_version(const char *input, char *out_version, size_t out_size);
-int save_user(const char *filename, const char *name, const char *email);
+int save_user(AppContext *ctx, const char *name, const char *email);
 int is_valid_name(const char *s);
 int is_valid_email(const char *s);
 int validate_nonce(const char *nonce);
@@ -403,9 +434,9 @@ static char *normalize_iss(const char *raw) {
         return NULL;
     }
     size_t len = strlen(normalized);
-    while (len > 0 && (isspace((unsigned char)raw[len - 1]) || raw[len - 1] == '/')) len--;
+    while (len > 0 && (isspace((unsigned char)normalized[len - 1]) || normalized[len - 1] == '/')) len--;
     size_t start = 0;
-    while (start < len && isspace((unsigned char)raw[start])) start++;
+    while (start < len && isspace((unsigned char)normalized[start])) start++;
     size_t new_len = len - start;
     char *out = malloc(new_len + 1);
     if (!out) {
@@ -413,7 +444,7 @@ static char *normalize_iss(const char *raw) {
         LOG_ERROR("Memory allocation failed for out in normalize_iss");
         return NULL;
     }
-    memcpy(out, raw + start, new_len);
+    memcpy(out, normalized + start, new_len);
     out[new_len] = '\0';
     free(normalized);
     return out;
@@ -495,14 +526,14 @@ char *read_file(const char *filepath) {
     return buf;
 }
 
-/* Helper: Decode base64url to binary (improved with BIO_ctrl_pending) */
+/* Helper: Decode base64url to binary (using EVP_DecodeBlock) */
 /**
  * base64url_decode - Decode base64url string to binary data
  * @in: Input base64url string
  * @out: Output buffer (malloc'ed by function)
  * @out_len: Length of decoded data
  *
- * Converts base64url to standard base64, decodes using OpenSSL BIO.
+ * Converts base64url to standard base64, decodes using OpenSSL EVP_DecodeBlock.
  * Returns 0 on success, non-zero on error.
  * Caller must free *out on success.
  */
@@ -511,71 +542,42 @@ static int base64url_decode(const char *in, unsigned char **out, size_t *out_len
         LOG_ERROR("NULL parameters in base64url_decode");
         return 0;
     }
-    BIO *bio, *b64;
-    char *in_copy = strdup(in);
-    if (!in_copy) {
-        LOG_ERROR("Memory allocation failed for in_copy in base64url_decode");
+    size_t inlen = strlen(in);
+    char *tmp = malloc(inlen + 5);
+    if (!tmp) {
+        LOG_ERROR("Memory allocation failed for tmp in base64url_decode");
         return 0;
     }
-    size_t in_len = strlen(in_copy);
+    memcpy(tmp, in, inlen);
+    tmp[inlen] = '\0';
+    for (size_t i = 0; i < inlen; ++i) {
+        if (tmp[i] == '-') tmp[i] = '+';
+        else if (tmp[i] == '_') tmp[i] = '/';
+    }
+    size_t pad = (4 - (inlen % 4)) % 4;
+    for (size_t i = 0; i < pad; ++i) tmp[inlen + i] = '=';
+    tmp[inlen + pad] = '\0';
 
-    // Replace base64url chars with standard base64
-    for (size_t i = 0; i < in_len; i++) {
-        if (in_copy[i] == '-') in_copy[i] = '+';
-        else if (in_copy[i] == '_') in_copy[i] = '/';
-    }
-
-    // Add padding if needed
-    size_t padding = in_len % 4;
-    if (padding) {
-        in_copy = realloc(in_copy, in_len + 4 - padding + 1);
-        if (!in_copy) {
-            LOG_ERROR("Memory reallocation failed for padding in base64url_decode");
-            return 0;
-        }
-        for (size_t i = 0; i < 4 - padding; i++) {
-            in_copy[in_len + i] = '=';
-        }
-        in_copy[in_len + (4 - padding)] = '\0';
-    }
-
-    bio = BIO_new_mem_buf(in_copy, -1);
-    if (!bio) {
-        LOG_ERROR("BIO_new_mem_buf failed in base64url_decode");
-        free(in_copy);
-        return 0;
-    }
-    b64 = BIO_new(BIO_f_base64());
-    if (!b64) {
-        LOG_ERROR("BIO_new for base64 failed in base64url_decode");
-        BIO_free(bio);
-        free(in_copy);
-        return 0;
-    }
-    bio = BIO_push(b64, bio);
-    BIO_set_flags(bio, BIO_FLAGS_BASE64_NO_NL);
-
-    *out_len = BIO_ctrl_pending(bio);  // Use BIO_ctrl_pending for accurate length
-    *out = malloc(*out_len);
-    if (!*out) {
-        LOG_ERROR("Memory allocation failed for out in base64url_decode");
-        BIO_free_all(bio);
-        free(in_copy);
-        return 0;
-    }
-    int decodeLen = BIO_read(bio, *out, *out_len);
-    if (decodeLen <= 0) {
-        LOG_ERROR("BIO_read failed in base64url_decode");
-        free(*out);
-        *out = NULL;
-        BIO_free_all(bio);
-        free(in_copy);
+    size_t max_out = (strlen(tmp) * 3) / 4 + 1;
+    unsigned char *buf = malloc(max_out);
+    if (!buf) {
+        free(tmp);
+        LOG_ERROR("Memory allocation failed for buf in base64url_decode");
         return 0;
     }
 
-    BIO_free_all(bio);
-    free(in_copy);
-    return decodeLen;
+    int decoded = EVP_DecodeBlock(buf, (const unsigned char*)tmp, (int)strlen(tmp));
+    free(tmp);
+    if (decoded < 0) {
+        free(buf);
+        LOG_ERROR("EVP_DecodeBlock failed in base64url_decode");
+        return 0;
+    }
+    /* Adjust for padding characters which EVP leaves as zero bytes */
+    while (decoded > 0 && buf[decoded - 1] == '\0') decoded--;
+    *out = buf;
+    *out_len = (size_t)decoded;
+    return 1;
 }
 
 /* JWKS-specific: Convert JWK to PEM (full OpenSSL implementation) */
@@ -725,20 +727,7 @@ json_t *fetch_jwks(const char *url, ProviderEntry *entry) {
         curl_easy_cleanup(curl);
         return NULL;
     }
-    if (curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, [](char *ptr, size_t size, size_t nmemb, void *userdata) -> size_t {
-        if (!ptr || !userdata) return 0;
-        struct curl_memory *mem = (struct curl_memory *)userdata;
-        size_t realsize = size * nmemb;
-        mem->data = realloc(mem->data, mem->size + realsize + 1);
-        if (!mem->data) {
-            LOG_ERROR("realloc failed in curl write callback");
-            return 0;
-        }
-        memcpy(&(mem->data[mem->size]), ptr, realsize);
-        mem->size += realsize;
-        mem->data[mem->size] = 0;
-        return realsize;
-    }) != CURLE_OK) {
+    if (curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_callback) != CURLE_OK) {
         LOG_ERROR("curl_easy_setopt writefunction failed");
         curl_easy_cleanup(curl);
         return NULL;
@@ -1514,30 +1503,26 @@ int validate_jwt_user(AppContext *ctx, const char *token) {
         return 0;
     }
     jwt_t *jwt = NULL;
-    int ok = 0;
+    // Decode header first to get kid and iss
     if (jwt_decode(&jwt, token, NULL, 0) != 0) {
-        LOG_ERROR("JWT decode failed (header parse) for token");
+        LOG_ERROR("JWT decode header failed for token");
         return 0;
     }
     if (!jwt) {
-        LOG_ERROR("jwt_decode returned NULL jwt");
+        LOG_ERROR("jwt_decode returned NULL jwt for header");
         return 0;
     }
 
     const char *kid = jwt_get_header(jwt, "kid");
-    const char *iss = jwt_get_grant(jwt, "iss");
-    const char *aud = jwt_get_grant(jwt, "aud");
-    const char *exp_str = jwt_get_grant(jwt, "exp");
-    const char *iat_str = jwt_get_grant(jwt, "iat");
-    if (!iss || !aud || !exp_str || !iat_str) {
-        LOG_ERROR("iss=%s kid=%s aud=%s verification=failed (missing claims)",
-               iss ? iss : "(null)", kid ? kid : "(null)", aud ? aud : "(null)");
+    const char *iss_claim = jwt_get_grant(jwt, "iss");
+    if (!iss_claim) {
+        LOG_ERROR("Missing iss in JWT header");
         jwt_free(jwt);
         return 0;
     }
 
     // Normalize iss for lookup
-    char *normalized_iss = normalize_iss(iss);
+    char *normalized_iss = normalize_iss(iss_claim);
     if (!normalized_iss) {
         jwt_free(jwt);
         return 0;
@@ -1549,22 +1534,21 @@ int validate_jwt_user(AppContext *ctx, const char *token) {
     pthread_mutex_unlock(&ctx->provider_lock);
     free(normalized_iss);  // Free normalized iss after lookup
     if (!entry) {
-        LOG_ERROR("iss=%s kid=%s aud=%s verification=failed (unknown issuer)",
-               iss, kid ? kid : "(null)", aud);
+        LOG_ERROR("Unknown issuer: %s", iss_claim);
         jwt_free(jwt);
         return 0;
     }
 
-    // First attempt with cached key
+    // Now decode with key for full validation
+    jwt_free(jwt);  // Free header-only jwt
+    jwt = NULL;
     if (pthread_mutex_lock(&entry->lock) != 0) {
         LOG_ERROR("pthread_mutex_lock failed for provider lock");
-        jwt_free(jwt);
         return 0;
     }
     const char *pubkey = entry->pubkey_pem;
     if (pthread_mutex_unlock(&entry->lock) != 0) {
         LOG_ERROR("pthread_mutex_unlock failed for provider lock");
-        jwt_free(jwt);
         return 0;
     }
 
@@ -1573,58 +1557,64 @@ int validate_jwt_user(AppContext *ctx, const char *token) {
         if (refresh_provider(entry) == 0) {
             if (pthread_mutex_lock(&entry->lock) != 0) {
                 LOG_ERROR("pthread_mutex_lock failed after refresh");
-                jwt_free(jwt);
                 return 0;
             }
             pubkey = entry->pubkey_pem;
             if (pthread_mutex_unlock(&entry->lock) != 0) {
                 LOG_ERROR("pthread_mutex_unlock failed after refresh");
-                jwt_free(jwt);
                 return 0;
             }
-            if (jwt_decode(&jwt, token, (unsigned char *)pubkey, strlen(pubkey)) == 0) {
-                ok = 1;
-            } else {
+            if (jwt_decode(&jwt, token, (unsigned char *)pubkey, strlen(pubkey)) != 0) {
                 LOG_ERROR("JWT decode failed after refresh");
+                return 0;
             }
         } else {
             LOG_ERROR("Refresh provider failed");
-        }
-    } else {
-        ok = 1;
-    }
-
-    if (ok) {
-        // Check aud
-        if (strcmp(aud, entry->expected_aud) != 0) {
-            LOG_ERROR("iss=%s kid=%s aud=%s verification=failed (aud mismatch)", iss, kid ? kid : "(null)", aud);
-            ok = 0;
-        }
-
-        // Check expiration
-        {
-            char *endptr;
-            long exp = strtol(exp_str, &endptr, 10);
-            if (*endptr != '\0' || exp < time(NULL)) {
-                LOG_ERROR("iss=%s kid=%s aud=%s verification=failed (expired)", iss, kid ? kid : "(null)", aud);
-                ok = 0;
-            }
-        }
-
-        // Check issued-at and replay protection
-        {
-            char *endptr;
-            long iat = strtol(iat_str, &endptr, 10);
-            if (*endptr != '\0' || iat < time(NULL) - MAX_TIMESTAMP_DRIFT || iat > time(NULL) + MAX_TIMESTAMP_DRIFT) {
-                LOG_ERROR("iss=%s kid=%s aud=%s verification=failed (iat out of range)", iss, kid ? kid : "(null)", aud);
-                ok = 0;
-            }
+            return 0;
         }
     }
+    if (!jwt) {
+        LOG_ERROR("jwt_decode returned NULL jwt after key decode");
+        return 0;
+    }
 
-    printf("[JWT] iss=%s kid=%s aud=%s verification=%s\n", iss, kid ? kid : "(null)", aud, ok ? "success" : "failed");
+    // Validate claims
+    const char *aud = jwt_get_grant(jwt, "aud");
+    const char *exp_str = jwt_get_grant(jwt, "exp");
+    const char *iat_str = jwt_get_grant(jwt, "iat");
+    if (!aud || !exp_str || !iat_str) {
+        LOG_ERROR("Missing required claims: aud, exp, iat");
+        jwt_free(jwt);
+        return 0;
+    }
+
+    // Check aud
+    if (strcmp(aud, entry->expected_aud) != 0) {
+        LOG_ERROR("aud mismatch: expected %s, got %s", entry->expected_aud, aud);
+        jwt_free(jwt);
+        return 0;
+    }
+
+    // Check expiration
+    char *endptr;
+    long exp = strtol(exp_str, &endptr, 10);
+    if (*endptr != '\0' || exp < time(NULL)) {
+        LOG_ERROR("JWT expired");
+        jwt_free(jwt);
+        return 0;
+    }
+
+    // Check issued-at
+    long iat = strtol(iat_str, &endptr, 10);
+    if (*endptr != '\0' || iat < time(NULL) - MAX_TIMESTAMP_DRIFT || iat > time(NULL) + MAX_TIMESTAMP_DRIFT) {
+        LOG_ERROR("iat out of range");
+        jwt_free(jwt);
+        return 0;
+    }
+
+    printf("[JWT] Validated: iss=%s, aud=%s\n", iss_claim, aud);
     jwt_free(jwt);
-    return ok;
+    return 1;
 }
 
 /* Check OAuth Bearer token - supports user JWT or app auth */
@@ -2091,8 +2081,8 @@ static int answer_to_connection(void *cls, struct MHD_Connection *connection, co
         json_decref(json_resp);
 
         /* Zero sensitive buffers after processing */
-        explicit_bzero(con_info->name, sizeof(con_info->name));
-        explicit_bzero(con_info->email, sizeof(con_info->email));
+        secure_zero(con_info->name, sizeof(con_info->name));
+        secure_zero(con_info->email, sizeof(con_info->email));
         con_info->name_len = con_info->email_len = 0;
 
         return ret;
@@ -2172,8 +2162,8 @@ int main() {
         free(tls_cert_pem);
         return 1;
     }
-    ctx.jwt_pubkey = read_file(ctx.PUBKEY_FILE);
-    ctx.app_pubkey = read_file(ctx.APP_PUBKEY_FILE);
+    ctx.jwt_pubkey = read_file(ctx.PUBKEY_FILE ? ctx.PUBKEY_FILE : DEFAULT_PUBKEY_FILE);
+    ctx.app_pubkey = read_file(ctx.APP_PUBKEY_FILE ? ctx.APP_PUBKEY_FILE : DEFAULT_APP_PUBKEY_FILE);
     if (pthread_mutex_unlock(&ctx.jwt_pubkey_lock) != 0) {
         LOG_ERROR("pthread_mutex_unlock failed for jwt_pubkey_lock in main");
     }
@@ -2291,8 +2281,8 @@ int main() {
     }
 
     printf("Secure REST server running with HTTPS on port %d\n", ctx.PORT);
-    printf("JWT validation enabled. Public key loaded from: %s\n", ctx.PUBKEY_FILE);
-    printf("App pubkey loaded from: %s\n", ctx.APP_PUBKEY_FILE);
+    printf("JWT validation enabled. Public key loaded from: %s\n", ctx.PUBKEY_FILE ? ctx.PUBKEY_FILE : DEFAULT_PUBKEY_FILE);
+    printf("App pubkey loaded from: %s\n", ctx.APP_PUBKEY_FILE ? ctx.APP_PUBKEY_FILE : DEFAULT_APP_PUBKEY_FILE);
     printf("Config loaded from: %s\n", ctx.config_path);
     printf("Rate limiting: %d requests per minute per IP\n", ctx.MAX_REQUESTS_PER_MINUTE);
     printf("Replay protection: JWT iat check (±%d seconds) and X-Nonce validation (max %d entries)\n", ctx.MAX_TIMESTAMP_DRIFT, ctx.MAX_NONCE_ENTRIES);
@@ -2301,7 +2291,7 @@ int main() {
     printf("Send SIGHUP (kill -HUP <pid>) to reload config at runtime.\n");
     printf("Try: curl -k -X POST -H \"Authorization: Bearer <JWT>\" -H \"X-Nonce: <unique-nonce>\" -H \"X-API-Version: 1.1\" -d \"name=Terry&email=terry@example.com\" https://127.0.0.1:%d/hello\n", ctx.PORT);
     printf("Or for app auth: curl -k -X POST -H \"X-App-Secret: replace_with_secure_random_value\" -H \"X-API-Version: 1.1\" -d \"name=Terry&email=terry@example.com\" https://127.0.0.1:%d/hello\n", ctx.PORT);
-    printf("User data saved in: %s\n", ctx.USERDATA_FILE);
+    printf("User data saved in: %s\n", ctx.USERDATA_FILE ? ctx.USERDATA_FILE : DEFAULT_USERDATA_FILE);
 
     /* Wait for shutdown signal */
     while (!shutdown_flag) {
@@ -2312,9 +2302,12 @@ int main() {
             }
             config_reload_requested = 0;
         }
-        if (pause() != 0 && errno != EINTR) {
-            perror("[ERROR] pause");
-        }
+#ifdef _WIN32
+        Sleep(500);  // Poll every 500ms on Windows
+#else
+        struct timespec ts = {0, 500 * 1000000}; // 0.5s
+        nanosleep(&ts, NULL);
+#endif
     }
 
     if (MHD_stop_daemon(daemon) != MHD_YES) {
