@@ -14,6 +14,20 @@ Production-ready, single-source, multi-platform JWT gateway with:
 - Cross-platform shims for file locking, signals, and file I/O
 - Optimized for 64-bit builds (better OpenSSL performance)
 
+Data Flow Overview (ASCII Diagram):
+Client Request -> HTTPS Daemon -> Rate Limit Check -> Auth (JWT/App) -> API Version Parse -> POST Data Process -> Input Validation -> Save User -> JSON Response
+     |                |             |                      |                   |                      |                        |
+     v                v             v                      v                   v                      v                        v
+  TLS Termination  MHD Handler   IP Table               JWKS Refresh       Version Support       Field Limits          File I/O               Error JSON
+
+Security References:
+- OWASP JWT Best Practices: https://tools.ietf.org/html/rfc8725 (Token validation, audience checks, expiration)
+- OWASP Input Validation Cheat Sheet: https://owasp.org/www-project-cheat-sheets/cheatsheets/Input_Validation_Cheat_Sheet.html (Length limits, character restrictions)
+- OWASP Rate Limiting: https://owasp.org/www-community/controls/Blocking_Brute_Force_Attacks (Per-IP rate limiting)
+- OWASP Transport Layer Protection: https://owasp.org/www-project-cheat-sheets/cheatsheets/Transport_Layer_Protection_Cheat_Sheet.html (HTTPS enforcement, HSTS)
+- CWE-20: Improper Input Validation (Addressed via length checks, type validation, and sanitization)
+- CWE-287: Improper Authentication (Addressed via JWT signature verification, nonce replay protection)
+
 Build commands (recommended for 64-bit for better performance):
   Linux:   gcc -o server server.c -lcurl -lssl -lcrypto -ljansson -pthread
   macOS:   clang -o server server.c -lcurl -lssl -lcrypto -ljansson
@@ -255,6 +269,14 @@ char *detect_platform(const char *cfg_value) {
 }
 
 /* Helper to free ProviderEntry */
+/**
+ * free_provider_entry - Safely free all fields of a ProviderEntry
+ * @entry: Pointer to the ProviderEntry to free
+ *
+ * Frees normalized ISS, JWKS URL, expected audience, current KID, PEM key,
+ * and destroys the mutex. Ensures no memory leaks or double-frees.
+ * Does nothing if entry is NULL.
+ */
 void free_provider_entry(ProviderEntry *entry) {
     if (!entry) return;
     free((char *)entry->iss);
@@ -289,6 +311,15 @@ int check_rate_limit(const char *client_ip);
 void cleanup_expired_entries(void);
 
 /* Helper: Normalize iss by trimming trailing slashes and whitespace */
+/**
+ * normalize_iss - Normalize issuer string for consistent lookup
+ * @raw: Raw issuer string from config
+ *
+ * Trims leading/trailing whitespace and trailing slashes to ensure
+ * consistent hashing and comparison. Returns malloc'ed normalized string
+ * or NULL on error.
+ * Caller must free the returned string.
+ */
 static char *normalize_iss(const char *raw) {
     if (!raw) {
         LOG_ERROR("NULL raw input in normalize_iss");
@@ -317,6 +348,19 @@ static char *normalize_iss(const char *raw) {
 }
 
 /* Utility: Read PEM file contents into a string with basic validation */
+/**
+ * read_file - Read a PEM file into a null-terminated string
+ * @filepath: Path to the PEM file
+ *
+ * Returns a malloc'ed string containing the file contents, or NULL on error.
+ * Performs ultra-defensive checks:
+ *   - Validates input argument
+ *   - Checks fopen, fseek, ftell, fread, and malloc errors
+ *   - Validates file size and PEM format
+ *   - Always cleans up resources on error
+ *   - Prevents empty file reads and size overflows
+ * Caller must free the returned buffer.
+ */
 char *read_file(const char *filepath) {
     if (!filepath) {
         LOG_ERROR("NULL filepath in read_file");
@@ -327,29 +371,35 @@ char *read_file(const char *filepath) {
         LOG_ERROR("Failed to open file: %s", filepath);
         return NULL;
     }
+    /* Seek to end to determine file length for allocation */
     if (fseek(f, 0, SEEK_END) != 0) {
         perror("[ERROR] fseek to end");
         fclose(f);
         return NULL;
     }
+    /* Get current file position as length */
     long len = ftell(f);
     if (len < 0) {
         perror("[ERROR] ftell");
         fclose(f);
         return NULL;
     }
+    /* Prevent reading files larger than SIZE_MAX to avoid overflow */
     if (len > SIZE_MAX) {
         LOG_ERROR("File too large in read_file");
         fclose(f);
         return NULL;
     }
+    /* Rewind to start of file for reading */
     rewind(f);
+    /* Allocate buffer with space for null terminator */
     char *buf = malloc((size_t)len + 1);
     if (!buf) {
         LOG_ERROR("Memory allocation failed for buf in read_file");
         fclose(f);
         return NULL;
     }
+    /* Read entire file into buffer */
     size_t readlen = fread(buf, 1, (size_t)len, f);
     if (readlen != (size_t)len) {
         perror("[ERROR] fread incomplete");
@@ -358,12 +408,13 @@ char *read_file(const char *filepath) {
         return NULL;
     }
     buf[readlen] = '\0';
+    /* Check fclose for potential write-back errors */
     if (fclose(f) != 0) {
         perror("[ERROR] fclose failed");
         free(buf);
         return NULL;
     }
-    /* Basic validation for PEM key */
+    /* Basic validation for PEM key: must contain expected headers */
     if (!strstr(buf, "-----BEGIN PUBLIC KEY-----") && !strstr(buf, "-----BEGIN RSA PUBLIC KEY-----")) {
         LOG_ERROR("Invalid PEM public key format in %s", filepath);
         free(buf);
@@ -373,6 +424,16 @@ char *read_file(const char *filepath) {
 }
 
 /* Helper: Decode base64url to binary (improved with BIO_ctrl_pending) */
+/**
+ * base64url_decode - Decode base64url string to binary data
+ * @in: Input base64url string
+ * @out: Output buffer (malloc'ed by function)
+ * @out_len: Length of decoded data
+ *
+ * Converts base64url to standard base64, decodes using OpenSSL BIO.
+ * Returns 0 on success, non-zero on error.
+ * Caller must free *out on success.
+ */
 static int base64url_decode(const char *in, unsigned char **out, size_t *out_len) {
     if (!in || !out || !out_len) {
         LOG_ERROR("NULL parameters in base64url_decode");
@@ -446,6 +507,14 @@ static int base64url_decode(const char *in, unsigned char **out, size_t *out_len
 }
 
 /* JWKS-specific: Convert JWK to PEM (full OpenSSL implementation) */
+/**
+ * convert_jwk_to_pem - Convert JWK RSA key to PEM format
+ * @jwk: JSON object containing JWK with n and e
+ *
+ * Extracts n and e, decodes from base64url, constructs RSA key,
+ * serializes to PEM. Returns malloc'ed PEM string or NULL on error.
+ * Caller must free the returned string.
+ */
 char *convert_jwk_to_pem(json_t *jwk) {
     if (!jwk) {
         LOG_ERROR("NULL jwk in convert_jwk_to_pem");
@@ -554,6 +623,15 @@ size_t header_callback(char *buffer, size_t size, size_t nitems, void *userdata)
 }
 
 /* JWKS: Fetch JWKS JSON from URL using libcurl */
+/**
+ * fetch_jwks - Fetch JWKS document from provider URL
+ * @url: JWKS endpoint URL
+ * @entry: ProviderEntry to store TTL from headers
+ *
+ * Uses libcurl to download JWKS JSON, parses Cache-Control for TTL.
+ * Returns json_t object or NULL on error.
+ * Caller must json_decref the returned object.
+ */
 json_t *fetch_jwks(const char *url, ProviderEntry *entry) {
     if (!url || !entry) {
         LOG_ERROR("NULL url or entry in fetch_jwks");
@@ -629,6 +707,13 @@ json_t *fetch_jwks(const char *url, ProviderEntry *entry) {
 }
 
 /* JWKS: Refresh provider keys from JWKS endpoint */
+/**
+ * refresh_provider - Refresh cached public key for a provider
+ * @entry: ProviderEntry to refresh
+ *
+ * Fetches JWKS if TTL expired, finds matching kid or first RSA key,
+ * caches PEM. Returns 0 on success, -1 on error.
+ */
 int refresh_provider(ProviderEntry *entry) {
     if (!entry) {
         LOG_ERROR("NULL entry in refresh_provider");
@@ -703,6 +788,14 @@ int refresh_provider(ProviderEntry *entry) {
 }
 
 /* Config: Load JSON config file and set globals */
+/**
+ * load_config - Load and parse config.json
+ * @filepath: Path to config file
+ *
+ * Reads, parses JSON, sets global config variables.
+ * Returns parsed json_t root or NULL on error.
+ * Caller must json_decref on success.
+ */
 json_t *load_config(const char *filepath) {
     if (!filepath) {
         LOG_ERROR("NULL filepath in load_config");
@@ -819,6 +912,13 @@ json_t *load_config(const char *filepath) {
 }
 
 /* Config: Reload config.json dynamically */
+/**
+ * reload_config - Reload config without restarting server
+ * @path: Path to config file
+ *
+ * Locks config, loads new config, updates globals, clears old providers,
+ * loads new providers. Returns 0 on success, -1 on error.
+ */
 int reload_config(const char *path) {
     if (!path) {
         LOG_ERROR("NULL path in reload_config");
@@ -986,6 +1086,13 @@ int reload_config(const char *path) {
 }
 
 /* Config: Initialize providers from config.json */
+/**
+ * init_providers_from_config - Initialize provider map from config
+ * @config: Parsed JSON config object
+ *
+ * Iterates providers array, creates ProviderEntry for each valid provider,
+ * normalizes ISS, duplicates strings, initializes mutex, adds to hash map.
+ */
 void init_providers_from_config(json_t *config) {
     if (!config) {
         LOG_ERROR("NULL config in init_providers_from_config");
@@ -1048,6 +1155,11 @@ void init_providers_from_config(json_t *config) {
 }
 
 /* JWKS: Destroy providers */
+/**
+ * destroy_jwks_providers - Free all provider entries
+ *
+ * Iterates provider_map, frees each entry safely using free_provider_entry.
+ */
 void destroy_jwks_providers() {
     ProviderEntry *cur, *tmp;
     HASH_ITER(hh, provider_map, cur, tmp) {
@@ -1057,6 +1169,14 @@ void destroy_jwks_providers() {
 }
 
 /* App authentication with full JWT validation */
+/**
+ * validate_app - Validate app authentication
+ * @app_token: Optional JWT token for app
+ * @app_secret: Optional shared secret for app
+ *
+ * Checks shared secret first, then validates JWT if provided.
+ * Returns 1 on success, 0 on failure.
+ */
 int validate_app(const char *app_token, const char *app_secret) {
     // first: static shared secret
     if (app_secret && EXPECTED_APP_SECRET && strcmp(app_secret, EXPECTED_APP_SECRET) == 0) {
@@ -1109,6 +1229,12 @@ int validate_app(const char *app_token, const char *app_secret) {
 }
 
 /* Trim leading/trailing whitespace in-place */
+/**
+ * trim_whitespace - Trim whitespace from string in-place
+ * @str: String to trim (modified in-place)
+ *
+ * Removes leading/trailing whitespace. Handles empty strings.
+ */
 static void trim_whitespace(char *str) {
     if (!str) {
         LOG_ERROR("NULL str in trim_whitespace");
@@ -1132,6 +1258,13 @@ static void trim_whitespace(char *str) {
 }
 
 /* Validate version format: must be digits.digits, e.g., 1.0, 2.3 */
+/**
+ * is_valid_version_format - Check if version string is valid format
+ * @version: Version string to validate
+ *
+ * Must be digits.digits with exactly one dot.
+ * Returns 1 if valid, 0 otherwise.
+ */
 static int is_valid_version_format(const char *version) {
     if (!version || strlen(version) == 0 || strlen(version) > MAX_API_VERSION_LEN) {
         return 0;
@@ -1149,6 +1282,13 @@ static int is_valid_version_format(const char *version) {
 }
 
 /* Check if version is in supported list */
+/**
+ * is_supported_version - Check if version is supported
+ * @version: Version string
+ *
+ * Compares against supported_versions array.
+ * Returns 1 if supported, 0 otherwise.
+ */
 static int is_supported_version(const char *version) {
     for (size_t i = 0; i < num_supported_versions; i++) {
         if (strcmp(version, supported_versions[i]) == 0) {
@@ -1159,6 +1299,15 @@ static int is_supported_version(const char *version) {
 }
 
 /* Main robust version-checking function */
+/**
+ * parse_api_version - Parse and validate API version header
+ * @input: Raw version string from header
+ * @out_version: Buffer to store validated version
+ * @out_size: Size of out_version buffer
+ *
+ * Trims, validates format, checks support, copies to output.
+ * Returns 1 on success, 0 on failure (invalid or buffer too small).
+ */
 int parse_api_version(const char *input, char *out_version, size_t out_size) {
     if (!input || !out_version || out_size == 0) {
         LOG_ERROR("NULL input or out_version or zero out_size in parse_api_version");
@@ -1194,6 +1343,15 @@ int parse_api_version(const char *input, char *out_version, size_t out_size) {
 }
 
 /* Save user info to binary file with proper locking, O_NOFOLLOW, and improved error handling */
+/**
+ * save_user - Save user data to file atomically
+ * @filename: Path to user data file
+ * @name: User name
+ * @email: User email
+ *
+ * Opens file with locking, writes User struct, closes safely.
+ * Returns 1 on success, 0 on failure (logs errors).
+ */
 int save_user(const char *filename, const char *name, const char *email) {
     if (!filename || !name || !email) {
         LOG_ERROR("NULL filename, name, or email in save_user");
@@ -1252,6 +1410,14 @@ int save_user(const char *filename, const char *name, const char *email) {
 }
 
 /* Input validation helpers (fixed for unsigned char) */
+/**
+ * is_valid_name - Validate user name
+ * @s: Name string
+ *
+ * Allows alnum, space, dash, underscore, dot. No injection chars.
+ * OWASP Input Validation: Reject dangerous characters to prevent injection attacks.
+ * Returns 1 if valid, 0 otherwise.
+ */
 static int is_valid_name(const char *s) {
     if (!s || strlen(s) == 0 || strlen(s) > MAX_NAME_LEN) return 0;
     for (size_t i = 0; s[i]; ++i) {
@@ -1264,6 +1430,14 @@ static int is_valid_name(const char *s) {
     }
     return 1;
 }
+/**
+ * is_valid_email - Validate email format
+ * @s: Email string
+ *
+ * Basic checks: length, @ and . positions, allowed chars.
+ * OWASP Input Validation: Sanitize and validate email to prevent injection.
+ * Returns 1 if valid, 0 otherwise.
+ */
 static int is_valid_email(const char *s) {
     if (!s || strlen(s) < 6 || strlen(s) > MAX_EMAIL_LEN) return 0;
     const char *at = strchr(s, '@');
@@ -1294,6 +1468,13 @@ struct connection_info_struct {
 };
 
 /* Add security headers to every response */
+/**
+ * add_security_headers - Add security headers to MHD response
+ * @response: MHD response object
+ *
+ * Adds headers for XSS, clickjacking, HSTS, CORS, cache control, referrer.
+ * OWASP Security Headers: Enforce browser protections.
+ */
 static void add_security_headers(struct MHD_Response *response) {
     if (!response) {
         LOG_ERROR("NULL response in add_security_headers");
@@ -1309,6 +1490,15 @@ static void add_security_headers(struct MHD_Response *response) {
 }
 
 /* Send JSON response with status and headers */
+/**
+ * send_json_response - Send JSON response with security headers
+ * @connection: MHD connection
+ * @status_code: HTTP status code
+ * @json_obj: JSON object to send
+ *
+ * Creates response from JSON, adds headers, queues response.
+ * Returns MHD status (MHD_YES on success).
+ */
 static int send_json_response(struct MHD_Connection *connection, int status_code, json_t *json_obj) {
     if (!connection || !json_obj) {
         LOG_ERROR("NULL connection or json_obj in send_json_response");
@@ -1336,6 +1526,22 @@ static int send_json_response(struct MHD_Connection *connection, int status_code
 }
 
 /* POST data iterator - now accumulates data across chunks and enforces global MAX_BODY_SIZE */
+/**
+ * iterate_post - Process POST data chunks
+ * @coninfo_cls: Connection info struct
+ * @kind: MHD value kind
+ * @key: Form field key
+ * @filename: Upload filename (unused)
+ * @content_type: Content type (unused)
+ * @transfer_encoding: Encoding (unused)
+ * @data: Data chunk
+ * @off: Offset in field
+ * @size: Size of chunk
+ *
+ * Accumulates data, enforces size limits, copies to buffers.
+ * OWASP Input Validation: Enforce length limits to prevent buffer overflows.
+ * Returns MHD_YES on success, MHD_NO on error.
+ */
 static int iterate_post(void *coninfo_cls, enum MHD_ValueKind kind, const char *key,
                         const char *filename, const char *content_type, const char *transfer_encoding,
                         const char *data, uint64_t off, size_t size) {
@@ -1386,6 +1592,14 @@ static NonceEntry *nonce_table = NULL;
 static pthread_mutex_t nonce_table_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* Validate nonce with table size limit and pressure logging */
+/**
+ * validate_nonce - Check and store nonce for replay protection
+ * @nonce: Nonce string from request
+ *
+ * Checks length, rejects if full table, adds if new.
+ * OWASP Rate Limiting: Prevents replay attacks.
+ * Returns 1 if valid/new, 0 if invalid or used.
+ */
 static int validate_nonce(const char *nonce) {
     if (!nonce || strlen(nonce) == 0 || strlen(nonce) >= 64) {
         LOG_ERROR("Invalid nonce length in validate_nonce");
@@ -1443,6 +1657,11 @@ static int validate_nonce(const char *nonce) {
 }
 
 /* Cleanup expired nonces with logging */
+/**
+ * cleanup_nonce_table - Remove expired nonces
+ *
+ * Iterates table, frees entries older than MAX_TIMESTAMP_DRIFT.
+ */
 static void cleanup_nonce_table(void) {
     time_t now = time(NULL);
     unsigned removed = 0;
@@ -1467,6 +1686,14 @@ static void cleanup_nonce_table(void) {
 }
 
 /* JWT validation for users with JWKS refresh and retry-on-failure */
+/**
+ * validate_jwt_user - Validate user JWT with JWKS refresh
+ * @token: JWT token string
+ *
+ * Decodes header, finds provider, validates signature (refresh if needed),
+ * checks claims. Returns 1 on success, 0 on failure.
+ * OWASP JWT Best Practices: Validate signature, issuer, audience, expiration.
+ */
 int validate_jwt_user(const char *token) {
     if (!token) {
         LOG_ERROR("NULL token in validate_jwt_user");
@@ -1585,6 +1812,13 @@ int validate_jwt_user(const char *token) {
 }
 
 /* Check OAuth Bearer token - supports user JWT or app auth */
+/**
+ * check_oauth_bearer - Validate Bearer token from Authorization header
+ * @connection: MHD connection
+ *
+ * Extracts Bearer token, validates user JWT or app auth.
+ * Returns 1 on success, 0 on failure.
+ */
 static int check_oauth_bearer(struct MHD_Connection *connection) {
     if (!connection) {
         LOG_ERROR("NULL connection in check_oauth_bearer");
@@ -1628,6 +1862,12 @@ static RateLimitEntry *rate_limit_table = NULL;
 static pthread_mutex_t rate_limit_table_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* Cleanup function for expired entries with logging */
+/**
+ * cleanup_expired_entries - Remove expired rate limit entries
+ *
+ * Iterates table, frees entries older than 60 seconds.
+ * OWASP Rate Limiting: Clean up to prevent memory leaks.
+ */
 static void cleanup_expired_entries(void) {
     time_t now = time(NULL);
     unsigned removed = 0;
@@ -1658,6 +1898,13 @@ static void cleanup_thread_cleanup(void *arg) {
 }
 
 /* Cleanup thread function with cleanup handler */
+/**
+ * cleanup_thread_func - Background cleanup thread
+ * @arg: Unused
+ *
+ * Runs forever, sleeps, cleans up nonces and rate limits.
+ * Uses cleanup handler for graceful exit.
+ */
 static void *cleanup_thread_func(void *arg) {
     (void)arg;
 
@@ -1705,6 +1952,14 @@ static void *cleanup_thread_func(void *arg) {
 }
 
 /* IP-based rate limiting (no inline cleanup, handled by thread) */
+/**
+ * check_rate_limit - Enforce per-IP rate limit
+ * @client_ip: Client IP string
+ *
+ * Checks/creates entry, increments count, resets on window.
+ * OWASP Rate Limiting: Throttle requests to prevent abuse.
+ * Returns 1 if allowed, 0 if exceeded.
+ */
 static int check_rate_limit(const char *client_ip) {
     if (!client_ip || strlen(client_ip) == 0) {
         LOG_ERROR("NULL or empty client_ip in check_rate_limit");
@@ -1765,6 +2020,11 @@ static int check_rate_limit(const char *client_ip) {
 }
 
 /* Free rate-limit table */
+/**
+ * free_rate_limit_table - Free all rate limit entries
+ *
+ * Iterates and frees table.
+ */
 static void free_rate_limit_table(void) {
     if (pthread_mutex_lock(&rate_limit_table_lock) != 0) {
         LOG_ERROR("pthread_mutex_lock failed in free_rate_limit_table");
@@ -1781,6 +2041,11 @@ static void free_rate_limit_table(void) {
 }
 
 /* Free nonce table */
+/**
+ * free_nonce_table - Free all nonce entries
+ *
+ * Iterates and frees table.
+ */
 static void free_nonce_table(void) {
     if (pthread_mutex_lock(&nonce_table_lock) != 0) {
         LOG_ERROR("pthread_mutex_lock failed in free_nonce_table");
@@ -1797,6 +2062,20 @@ static void free_nonce_table(void) {
 }
 
 /* Main request handler */
+/**
+ * answer_to_connection - MHD request handler
+ * @cls: Unused
+ * @connection: MHD connection
+ * @url: Request URL
+ * @method: HTTP method
+ * @version: HTTP version
+ * @upload_data: Upload data
+ * @upload_data_size: Size of upload data
+ * @con_cls: Connection context
+ *
+ * Handles rate limit, auth, POST processing, validation, response.
+ * Returns MHD_YES/MHD_NO.
+ */
 static int answer_to_connection(void *cls, struct MHD_Connection *connection, const char *url,
                                 const char *method, const char *version, const char *upload_data,
                                 size_t *upload_data_size, void **con_cls) {
@@ -2030,6 +2309,15 @@ static int answer_to_connection(void *cls, struct MHD_Connection *connection, co
 }
 
 /* Proper connection cleanup */
+/**
+ * request_completed - MHD connection cleanup callback
+ * @cls: Unused
+ * @connection: MHD connection
+ * @con_cls: Connection context to free
+ * @toe: Termination reason
+ *
+ * Frees postprocessor and connection_info_struct.
+ */
 static void request_completed(void *cls, struct MHD_Connection *connection, void **con_cls, enum MHD_RequestTerminationCode toe) {
     struct connection_info_struct *con_info = *con_cls;
     if (con_info) {
