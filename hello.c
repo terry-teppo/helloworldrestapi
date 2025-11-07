@@ -64,6 +64,7 @@ Config example in file comments below.
 #include <sys/stat.h>
 #include <signal.h>
 #include <strings.h>
+#include <regex.h>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -126,6 +127,10 @@ static const size_t num_supported_versions = sizeof(supported_versions)/sizeof(s
 static char *jwt_pubkey = NULL;
 static char *app_pubkey = NULL;
 static pthread_mutex_t jwt_pubkey_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Email validation regex */
+static regex_t email_regex;
+static int email_regex_compiled = 0;
 
 /* Updated ProviderEntry for JWKS caching */
 typedef struct {
@@ -1431,27 +1436,16 @@ static int is_valid_name(const char *s) {
     return 1;
 }
 /**
- * is_valid_email - Validate email format
+ * is_valid_email - Validate email format using RFC 5322 subset regex
  * @s: Email string
  *
- * Basic checks: length, @ and . positions, allowed chars.
+ * Uses POSIX regex for validation: ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$
  * OWASP Input Validation: Sanitize and validate email to prevent injection.
  * Returns 1 if valid, 0 otherwise.
  */
 static int is_valid_email(const char *s) {
     if (!s || strlen(s) < 6 || strlen(s) > MAX_EMAIL_LEN) return 0;
-    const char *at = strchr(s, '@');
-    const char *dot = strrchr(s, '.');
-    if (!at || !dot || at > dot || at == s || dot == s + strlen(s) - 1) return 0;
-    for (size_t i = 0; s[i]; ++i) {
-        if (!isalnum((unsigned char)s[i]) && s[i] != '.' && s[i] != '@' && s[i] != '-' && s[i] != '_' && s[i] != '+') {
-            return 0;
-        }
-        if (s[i] == '<' || s[i] == '>' || s[i] == '"' || s[i] == '\'') {
-            return 0;
-        }
-    }
-    return 1;
+    return regexec(&email_regex, s, 0, NULL, 0) == 0;
 }
 
 /* Connection context with buffers for accumulating POST data and total bytes, plus API version */
@@ -2339,6 +2333,14 @@ int main() {
         return 1;
     }
 
+    // Compile email regex
+    if (regcomp(&email_regex, "^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$", REG_EXTENDED | REG_NOSUB) != 0) {
+        LOG_ERROR("Failed to compile email regex");
+        json_decref(config);
+        return 1;
+    }
+    email_regex_compiled = 1;
+
     char *tls_key_pem = read_file(key_path);
     char *tls_cert_pem = read_file(cert_path);
 
@@ -2590,6 +2592,11 @@ int main() {
     free(PUBKEY_FILE);
     free(APP_PUBKEY_FILE);
 
+    // Free email regex
+    if (email_regex_compiled) {
+        regfree(&email_regex);
+    }
+
     printf("Server shut down gracefully.\n");
     return 0;
 }
@@ -2649,3 +2656,5 @@ EXAMPLE CONFIG.JSON
 }
 ================================================================================
 */
+
+}
