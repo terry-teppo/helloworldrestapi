@@ -1,0 +1,4 @@
+*.o
+server
+*.bin
+/tmp/

@@ -1,6 +1,6 @@
 /*
 ================================================================================
-SECURE REST SERVER: UNIFIED MEGA-TEMPLATE (CROSS-PLATFORM) - VERSION 38
+SECURE REST SERVER: UNIFIED MEGA-TEMPLATE (CROSS-PLATFORM) - VERSION 39
 ================================================================================
 Production-ready, single-source, multi-platform JWT gateway with:
 - Runtime config-driven behavior (no recompilation needed)
@@ -13,12 +13,13 @@ Production-ready, single-source, multi-platform JWT gateway with:
 - Thread-safe operations, graceful shutdown
 - Cross-platform shims for file locking, signals, and file I/O
 - Optimized for 64-bit builds (better OpenSSL performance)
+- CivetWeb HTTP server with OpenSSL for SSL/TLS support
 
 Data Flow Overview (ASCII Diagram):
 Client Request -> HTTPS Daemon -> Rate Limit Check -> Auth (JWT/App) -> API Version Parse -> POST Data Process -> Input Validation -> Save User -> JSON Response
      |                |             |                      |                   |                      |                        |
      v                v             v                      v                   v                      v                        v
-  TLS Termination  MHD Handler   IP Table               JWKS Refresh       Version Support       Field Limits          File I/O               Error JSON
+  TLS Termination  CivetWeb Handler   IP Table         JWKS Refresh       Version Support       Field Limits          File I/O               Error JSON
 
 Security References:
 - OWASP JWT Best Practices: https://tools.ietf.org/html/rfc8725 (Token validation, audience checks, expiration)
@@ -29,10 +30,10 @@ Security References:
 - CWE-287: Improper Authentication (Addressed via JWT signature verification, nonce replay protection)
 
 Build commands (recommended for 64-bit for better performance):
-  Linux:   gcc -o server server.c -lcurl -lssl -lcrypto -ljansson -pthread
-  macOS:   clang -o server server.c -lcurl -lssl -lcrypto -ljansson
-  Windows: cl server.c /link ws2_32.lib User32.lib Advapi32.lib Crypt32.lib
-           (For MinGW-w64: x86_64-w64-mingw32-gcc server.c -o server.exe -lcurl -lssl -lcrypto -ljansson -pthread)
+  Linux:   gcc -o server hello.c civetweb.c -lcurl -lssl -lcrypto -ljansson -pthread -ldl
+  macOS:   clang -o server hello.c civetweb.c -lcurl -lssl -lcrypto -ljansson -pthread
+  Windows: cl hello.c civetweb.c /link ws2_32.lib User32.lib Advapi32.lib Crypt32.lib
+           (For MinGW-w64: x86_64-w64-mingw32-gcc hello.c civetweb.c -o server.exe -lcurl -lssl -lcrypto -ljansson -pthread)
 
 Run with: ./server (config.json in same dir)
 Reload: kill -HUP <pid> (POSIX) or Ctrl+Break (Windows simulation)
@@ -41,7 +42,7 @@ Config example in file comments below.
 ================================================================================
 */
 
-#include <microhttpd.h>
+#include "civetweb.h"
 #include <jansson.h>
 #include <jwt.h>
 #include <curl/curl.h>
@@ -108,6 +109,10 @@ typedef struct {
 #define PLATFORM_STR "linux"
 #endif
 
+/* Forward declare types */
+typedef struct ProviderEntry_s ProviderEntry;
+struct connection_info_struct;
+
 /* --- AppContext: Central shared state --- */
 typedef struct {
     ProviderEntry *provider_map;
@@ -137,7 +142,7 @@ typedef struct {
 } AppContext;
 
 /* Updated ProviderEntry for JWKS caching */
-typedef struct {
+struct ProviderEntry_s {
     char *iss;          // changed to char* for uthash
     const char *jwks_url;     // JWKS endpoint URL
     const char *expected_aud; // expected audience for validation
@@ -147,7 +152,7 @@ typedef struct {
     time_t ttl;               // time-to-live for cache
     pthread_mutex_t lock;     // thread-safe updates
     UT_hash_handle hh;
-} ProviderEntry;
+};
 
 /* Cleanup thread */
 static pthread_t cleanup_thread;
@@ -163,8 +168,14 @@ static volatile sig_atomic_t config_reload_requested = 0;
 static regex_t email_regex;
 static int email_regex_compiled = 0;
 
+/* curl memory structure */
+struct curl_memory {
+    char *data;
+    size_t size;
+};
+
 /* Static functions for curl callbacks */
-static size_t curl_write_callback(char *ptr, size_t size, size_t nmemb, void *userdata) {
+static size_t my_curl_write_callback(char *ptr, size_t size, size_t nmemb, void *userdata) {
     struct curl_memory *mem = (struct curl_memory *)userdata;
     size_t realsize = size * nmemb;
     mem->data = realloc(mem->data, mem->size + realsize + 1);
@@ -333,17 +344,19 @@ void free_provider_map(void);
 int validate_app(const char *app_token, const char *app_secret);
 void trim_whitespace(char *str);
 int is_valid_version_format(const char *version);
-int is_supported_version(const char *version);
-int parse_api_version(const char *input, char *out_version, size_t out_size);
+int is_supported_version(AppContext *ctx, const char *version);
+int parse_api_version(AppContext *ctx, const char *input, char *out_version, size_t out_size);
 int save_user(AppContext *ctx, const char *name, const char *email);
-int is_valid_name(const char *s);
-int is_valid_email(const char *s);
+int is_valid_name(AppContext *ctx, const char *s);
+int is_valid_email(AppContext *ctx, const char *s);
 int validate_nonce(const char *nonce);
 void cleanup_nonce_table(void);
 int validate_jwt_user(AppContext *ctx, const char *token);
-int check_oauth_bearer(AppContext *ctx, struct MHD_Connection *connection);
+int check_oauth_bearer(AppContext *ctx, struct mg_connection *conn);
 int check_rate_limit(const char *client_ip);
 void cleanup_expired_entries(void);
+void init_providers_from_config(AppContext *ctx, json_t *config);
+int parse_post_data(AppContext *ctx, const char *post_data, size_t data_len, struct connection_info_struct *con_info);
 
 /* --- Initialize AppContext --- */
 int init_context(AppContext *ctx, const char *config_path) {
@@ -727,7 +740,7 @@ json_t *fetch_jwks(const char *url, ProviderEntry *entry) {
         curl_easy_cleanup(curl);
         return NULL;
     }
-    if (curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_callback) != CURLE_OK) {
+    if (curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, my_curl_write_callback) != CURLE_OK) {
         LOG_ERROR("curl_easy_setopt writefunction failed");
         curl_easy_cleanup(curl);
         return NULL;
@@ -1042,7 +1055,7 @@ int validate_app(const char *app_token, const char *app_secret) {
  *
  * Removes leading/trailing whitespace. Handles empty strings.
  */
-static void trim_whitespace(char *str) {
+void trim_whitespace(char *str) {
     if (!str) {
         LOG_ERROR("NULL str in trim_whitespace");
         return;
@@ -1072,8 +1085,8 @@ static void trim_whitespace(char *str) {
  * Must be digits.digits with exactly one dot.
  * Returns 1 if valid, 0 otherwise.
  */
-static int is_valid_version_format(const char *version) {
-    if (!version || strlen(version) == 0 || strlen(version) > MAX_API_VERSION_LEN) {
+int is_valid_version_format(const char *version) {
+    if (!version || strlen(version) == 0 || strlen(version) > DEFAULT_MAX_API_VERSION_LEN) {
         return 0;
     }
 
@@ -1097,7 +1110,7 @@ static int is_valid_version_format(const char *version) {
  * Compares against supported_versions array.
  * Returns 1 if supported, 0 otherwise.
  */
-static int is_supported_version(AppContext *ctx, const char *version) {
+int is_supported_version(AppContext *ctx, const char *version) {
     if (!ctx || !version) return 0;
     for (size_t i = 0; i < ctx->num_supported_versions; i++) {
         if (strcmp(version, ctx->supported_versions[i]) == 0) {
@@ -1124,7 +1137,7 @@ int parse_api_version(AppContext *ctx, const char *input, char *out_version, siz
         return 0;
     }
 
-    char tmp[MAX_API_VERSION_LEN + 1];
+    char tmp[DEFAULT_MAX_API_VERSION_LEN + 1];
     size_t len = strlen(input);
     if (len > sizeof(tmp) - 1) {
         LOG_ERROR("Input too long in parse_api_version");
@@ -1229,7 +1242,7 @@ int save_user(AppContext *ctx, const char *name, const char *email) {
  * OWASP Input Validation: Reject dangerous characters to prevent injection attacks.
  * Returns 1 if valid, 0 otherwise.
  */
-static int is_valid_name(AppContext *ctx, const char *s) {
+int is_valid_name(AppContext *ctx, const char *s) {
     if (!ctx || !s || strlen(s) == 0 || strlen(s) > ctx->MAX_NAME_LEN) return 0;
     for (size_t i = 0; s[i]; ++i) {
         if (!isalnum((unsigned char)s[i]) && s[i] != ' ' && s[i] != '-' && s[i] != '_' && s[i] != '.') {
@@ -1250,137 +1263,147 @@ static int is_valid_name(AppContext *ctx, const char *s) {
  * OWASP Input Validation: Sanitize and validate email to prevent injection.
  * Returns 1 if valid, 0 otherwise.
  */
-static int is_valid_email(AppContext *ctx, const char *s) {
+int is_valid_email(AppContext *ctx, const char *s) {
     if (!ctx || !s || strlen(s) < 6 || strlen(s) > ctx->MAX_EMAIL_LEN) return 0;
     return regexec(&email_regex, s, 0, NULL, 0) == 0;
 }
 
 /* Connection context with buffers for accumulating POST data and total bytes, plus API version */
 struct connection_info_struct {
-    struct MHD_PostProcessor *postprocessor;
-    char name[MAX_NAME_LEN + 1];
+    char name[256];
     size_t name_len;
-    char email[MAX_EMAIL_LEN + 1];
+    char email[256];
     size_t email_len;
     size_t total_bytes; /* Track total POST data bytes */
     int authenticated;
     char client_ip[INET6_ADDRSTRLEN]; /* Support IPv6 */
-    char api_version[MAX_API_VERSION_LEN + 1]; /* API version, e.g., "1.0", "1.1" */
+    char api_version[32]; /* API version, e.g., "1.0", "1.1" */
+    char *post_data; /* Buffer for POST data */
+    size_t post_data_len; /* Length of POST data */
 };
 
 /* Add security headers to every response */
 /**
- * add_security_headers - Add security headers to MHD response
- * @response: MHD response object
+ * add_security_headers - Add security headers to CivetWeb connection
+ * @conn: CivetWeb connection object
  *
  * Adds headers for XSS, clickjacking, HSTS, CORS, cache control, referrer.
  * OWASP Security Headers: Enforce browser protections.
  */
-static void add_security_headers(struct MHD_Response *response) {
-    if (!response) {
-        LOG_ERROR("NULL response in add_security_headers");
+static void add_security_headers(struct mg_connection *conn) {
+    if (!conn) {
+        LOG_ERROR("NULL conn in add_security_headers");
         return;
     }
-    MHD_add_response_header(response, "X-Content-Type-Options", "nosniff");
-    MHD_add_response_header(response, "X-Frame-Options", "DENY");
-    MHD_add_response_header(response, "Strict-Transport-Security", "max-age=63072000; includeSubDomains; preload");
-    MHD_add_response_header(response, "Access-Control-Allow-Origin", "https://yourdomain.com");
-    MHD_add_response_header(response, "Cache-Control", "no-store");
-    MHD_add_response_header(response, "Referrer-Policy", "no-referrer");
-    MHD_add_response_header(response, "Permissions-Policy", "geolocation=(), microphone=(), camera=()");
+    mg_printf(conn, "X-Content-Type-Options: nosniff\r\n");
+    mg_printf(conn, "X-Frame-Options: DENY\r\n");
+    mg_printf(conn, "Strict-Transport-Security: max-age=63072000; includeSubDomains; preload\r\n");
+    mg_printf(conn, "Access-Control-Allow-Origin: https://yourdomain.com\r\n");
+    mg_printf(conn, "Cache-Control: no-store\r\n");
+    mg_printf(conn, "Referrer-Policy: no-referrer\r\n");
+    mg_printf(conn, "Permissions-Policy: geolocation=(), microphone=(), camera=()\r\n");
 }
 
 /* Send JSON response with status and headers */
 /**
  * send_json_response - Send JSON response with security headers
- * @connection: MHD connection
+ * @conn: CivetWeb connection
  * @status_code: HTTP status code
  * @json_obj: JSON object to send
  *
- * Creates response from JSON, adds headers, queues response.
- * Returns MHD status (MHD_YES on success).
+ * Creates response from JSON, adds headers, sends response.
+ * Returns 1 on success, 0 on failure.
  */
-static int send_json_response(struct MHD_Connection *connection, int status_code, json_t *json_obj) {
-    if (!connection || !json_obj) {
-        LOG_ERROR("NULL connection or json_obj in send_json_response");
-        return MHD_NO;
+static int send_json_response(struct mg_connection *conn, int status_code, json_t *json_obj) {
+    if (!conn || !json_obj) {
+        LOG_ERROR("NULL conn or json_obj in send_json_response");
+        return 0;
     }
     char *json_str = json_dumps(json_obj, 0);
     if (!json_str) {
         LOG_ERROR("json_dumps failed in send_json_response");
-        return MHD_NO;
+        return 0;
     }
-    struct MHD_Response *response = MHD_create_response_from_buffer(strlen(json_str), (void*) json_str, MHD_RESPMEM_MUST_FREE);
-    if (!response) {
-        LOG_ERROR("MHD_create_response_from_buffer failed");
-        free(json_str);
-        return MHD_NO;
-    }
-    MHD_add_response_header(response, "Content-Type", "application/json; charset=utf-8");
-    add_security_headers(response);
-    int ret = MHD_queue_response(connection, status_code, response);
-    if (ret == MHD_NO) {
-        LOG_ERROR("MHD_queue_response failed");
-    }
-    MHD_destroy_response(response);
-    return ret;
+    
+    const char *status_text = "OK";
+    if (status_code == 400) status_text = "Bad Request";
+    else if (status_code == 401) status_text = "Unauthorized";
+    else if (status_code == 404) status_text = "Not Found";
+    else if (status_code == 413) status_text = "Payload Too Large";
+    else if (status_code == 429) status_text = "Too Many Requests";
+    else if (status_code == 500) status_text = "Internal Server Error";
+    else if (status_code == 204) status_text = "No Content";
+    
+    mg_printf(conn, "HTTP/1.1 %d %s\r\n", status_code, status_text);
+    mg_printf(conn, "Content-Type: application/json; charset=utf-8\r\n");
+    add_security_headers(conn);
+    mg_printf(conn, "Content-Length: %zu\r\n\r\n", strlen(json_str));
+    mg_write(conn, json_str, strlen(json_str));
+    
+    free(json_str);
+    return 1;
 }
 
-/* POST data iterator - now accumulates data across chunks and enforces global MAX_BODY_SIZE */
+/* Parse URL-encoded POST data */
 /**
- * iterate_post - Process POST data chunks
- * @ctx: AppContext for max body size
- * @coninfo_cls: Connection info struct
- * @kind: MHD value kind
- * @key: Form field key
- * @filename: Upload filename (unused)
- * @content_type: Content type (unused)
- * @transfer_encoding: Encoding (unused)
- * @data: Data chunk
- * @off: Offset in field
- * @size: Size of chunk
+ * parse_post_data - Parse URL-encoded POST data
+ * @ctx: AppContext for max sizes
+ * @post_data: POST data string
+ * @data_len: Length of POST data
+ * @con_info: Connection info to populate
  *
- * Accumulates data, enforces size limits, copies to buffers.
+ * Parses name=value&name=value format, enforces size limits.
  * OWASP Input Validation: Enforce length limits to prevent buffer overflows.
- * Returns MHD_YES on success, MHD_NO on error.
+ * Returns 1 on success, 0 on error.
  */
-static int iterate_post(AppContext *ctx, void *coninfo_cls, enum MHD_ValueKind kind, const char *key,
-                        const char *filename, const char *content_type, const char *transfer_encoding,
-                        const char *data, uint64_t off, size_t size) {
-    if (!ctx || !coninfo_cls || !key || !data) {
-        LOG_ERROR("NULL ctx, coninfo_cls, key, or data in iterate_post");
-        return MHD_NO;
+int parse_post_data(AppContext *ctx, const char *post_data, size_t data_len, 
+                          struct connection_info_struct *con_info) {
+    if (!ctx || !post_data || !con_info) {
+        LOG_ERROR("NULL parameters in parse_post_data");
+        return 0;
     }
-    struct connection_info_struct *con_info = (struct connection_info_struct *)coninfo_cls;
-
-    /* Increment total bytes and reject if exceeded */
-    if (size > SIZE_MAX - con_info->total_bytes) {
-        LOG_ERROR("Size overflow in iterate_post");
-        return MHD_NO;
+    
+    if (data_len > ctx->MAX_BODY_SIZE) {
+        LOG_ERROR("POST data too large");
+        return 0;
     }
-    con_info->total_bytes += size;
-    if (con_info->total_bytes > ctx->MAX_BODY_SIZE) {
-        return MHD_NO;  /* Abort request, triggers error response */
+    
+    char *data_copy = malloc(data_len + 1);
+    if (!data_copy) {
+        LOG_ERROR("Memory allocation failed in parse_post_data");
+        return 0;
     }
-
-    if (strcmp(key, "name") == 0 && off + size <= ctx->MAX_NAME_LEN) {
-        if (off + size > ctx->MAX_NAME_LEN) {
-            LOG_ERROR("Name field too long in iterate_post");
-            return MHD_NO;
+    memcpy(data_copy, post_data, data_len);
+    data_copy[data_len] = '\0';
+    
+    char *saveptr = NULL;
+    char *token = strtok_r(data_copy, "&", &saveptr);
+    while (token != NULL) {
+        char *eq = strchr(token, '=');
+        if (eq) {
+            *eq = '\0';
+            const char *key = token;
+            const char *value = eq + 1;
+            
+            if (strcmp(key, "name") == 0) {
+                size_t len = strlen(value);
+                if (len > ctx->MAX_NAME_LEN) len = ctx->MAX_NAME_LEN;
+                memcpy(con_info->name, value, len);
+                con_info->name[len] = '\0';
+                con_info->name_len = len;
+            } else if (strcmp(key, "email") == 0) {
+                size_t len = strlen(value);
+                if (len > ctx->MAX_EMAIL_LEN) len = ctx->MAX_EMAIL_LEN;
+                memcpy(con_info->email, value, len);
+                con_info->email[len] = '\0';
+                con_info->email_len = len;
+            }
         }
-        memcpy(con_info->name + off, data, size);
-        con_info->name_len = off + size;
-        con_info->name[con_info->name_len] = '\0'; /* Null-terminate */
-    } else if (strcmp(key, "email") == 0 && off + size <= ctx->MAX_EMAIL_LEN) {
-        if (off + size > ctx->MAX_EMAIL_LEN) {
-            LOG_ERROR("Email field too long in iterate_post");
-            return MHD_NO;
-        }
-        memcpy(con_info->email + off, data, size);
-        con_info->email_len = off + size;
-        con_info->email[con_info->email_len] = '\0'; /* Null-terminate */
+        token = strtok_r(NULL, "&", &saveptr);
     }
-    return MHD_YES;
+    
+    free(data_copy);
+    return 1;
 }
 
 /* Nonce entry for replay protection */
@@ -1402,7 +1425,7 @@ static pthread_mutex_t nonce_table_lock = PTHREAD_MUTEX_INITIALIZER;
  * OWASP Rate Limiting: Prevents replay attacks.
  * Returns 1 if valid/new, 0 if invalid or used.
  */
-static int validate_nonce(const char *nonce) {
+int validate_nonce(const char *nonce) {
     if (!nonce || strlen(nonce) == 0 || strlen(nonce) >= 64) {
         LOG_ERROR("Invalid nonce length in validate_nonce");
         return 0; // Invalid nonce
@@ -1414,7 +1437,7 @@ static int validate_nonce(const char *nonce) {
     }
 
     /* Reject if table is full to prevent memory exhaustion */
-    if (HASH_COUNT(nonce_table) >= MAX_NONCE_ENTRIES) {
+    if (HASH_COUNT(nonce_table) >= DEFAULT_MAX_NONCE_ENTRIES) {
         /* Log pressure: count and oldest timestamp */
         time_t oldest = time(NULL);
         NonceEntry *e, *tmp;
@@ -1462,9 +1485,9 @@ static int validate_nonce(const char *nonce) {
 /**
  * cleanup_nonce_table - Remove expired nonces
  *
- * Iterates table, frees entries older than MAX_TIMESTAMP_DRIFT.
+ * Iterates table, frees entries older than DEFAULT_MAX_TIMESTAMP_DRIFT.
  */
-static void cleanup_nonce_table(void) {
+void cleanup_nonce_table(void) {
     time_t now = time(NULL);
     unsigned removed = 0;
     if (pthread_mutex_lock(&nonce_table_lock) != 0) {
@@ -1473,7 +1496,7 @@ static void cleanup_nonce_table(void) {
     }
     NonceEntry *current, *tmp;
     HASH_ITER(hh, nonce_table, current, tmp) {
-        if (now - current->timestamp > MAX_TIMESTAMP_DRIFT) {
+        if (now - current->timestamp > DEFAULT_MAX_TIMESTAMP_DRIFT) {
             HASH_DEL(nonce_table, current);
             free(current);
             removed++;
@@ -1606,7 +1629,7 @@ int validate_jwt_user(AppContext *ctx, const char *token) {
 
     // Check issued-at
     long iat = strtol(iat_str, &endptr, 10);
-    if (*endptr != '\0' || iat < time(NULL) - MAX_TIMESTAMP_DRIFT || iat > time(NULL) + MAX_TIMESTAMP_DRIFT) {
+    if (*endptr != '\0' || iat < time(NULL) - DEFAULT_MAX_TIMESTAMP_DRIFT || iat > time(NULL) + DEFAULT_MAX_TIMESTAMP_DRIFT) {
         LOG_ERROR("iat out of range");
         jwt_free(jwt);
         return 0;
@@ -1621,26 +1644,26 @@ int validate_jwt_user(AppContext *ctx, const char *token) {
 /**
  * check_oauth_bearer - Validate Bearer token from Authorization header
  * @ctx: AppContext for provider access
- * @connection: MHD connection
+ * @conn: CivetWeb connection
  *
  * Extracts Bearer token, validates user JWT or app auth.
  * Returns 1 on success, 0 on failure.
  */
-static int check_oauth_bearer(AppContext *ctx, struct MHD_Connection *connection) {
-    if (!ctx || !connection) {
-        LOG_ERROR("NULL ctx or connection in check_oauth_bearer");
+int check_oauth_bearer(AppContext *ctx, struct mg_connection *conn) {
+    if (!ctx || !conn) {
+        LOG_ERROR("NULL ctx or conn in check_oauth_bearer");
         return 0;
     }
-    const char *auth_header = MHD_lookup_connection_value(connection, MHD_HEADER_KIND, "Authorization");
-    const char *app_secret = MHD_lookup_connection_value(connection, MHD_HEADER_KIND, "X-App-Secret");
-    const char *app_token = MHD_lookup_connection_value(connection, MHD_HEADER_KIND, "X-App-Token");
+    const char *auth_header = mg_get_header(conn, "Authorization");
+    const char *app_secret = mg_get_header(conn, "X-App-Secret");
+    const char *app_token = mg_get_header(conn, "X-App-Token");
 
     // Try user JWT first
     if (auth_header && strncmp(auth_header, "Bearer ", 7) == 0) {
         const char *token = auth_header + 7;
         if (validate_jwt_user(ctx, token)) {
             /* Check nonce for replay protection */
-            const char *nonce = MHD_lookup_connection_value(connection, MHD_HEADER_KIND, "X-Nonce");
+            const char *nonce = mg_get_header(conn, "X-Nonce");
             if (!nonce || !validate_nonce(nonce)) {
                 LOG_ERROR("Invalid or reused nonce");
                 return 0;
@@ -1675,7 +1698,7 @@ static pthread_mutex_t rate_limit_table_lock = PTHREAD_MUTEX_INITIALIZER;
  * Iterates table, frees entries older than 60 seconds.
  * OWASP Rate Limiting: Clean up to prevent memory leaks.
  */
-static void cleanup_expired_entries(void) {
+void cleanup_expired_entries(void) {
     time_t now = time(NULL);
     unsigned removed = 0;
     if (pthread_mutex_lock(&rate_limit_table_lock) != 0) {
@@ -1767,7 +1790,7 @@ static void *cleanup_thread_func(void *arg) {
  * OWASP Rate Limiting: Throttle requests to prevent abuse.
  * Returns 1 if allowed, 0 if exceeded.
  */
-static int check_rate_limit(const char *client_ip) {
+int check_rate_limit(const char *client_ip) {
     if (!client_ip || strlen(client_ip) == 0) {
         LOG_ERROR("NULL or empty client_ip in check_rate_limit");
         return 0;
@@ -1813,7 +1836,7 @@ static int check_rate_limit(const char *client_ip) {
         return 1;
     }
 
-    if (entry->request_count >= MAX_REQUESTS_PER_MINUTE) {
+    if (entry->request_count >= DEFAULT_MAX_REQUESTS_PER_MINUTE) {
         if (pthread_mutex_unlock(&rate_limit_table_lock) != 0) {
             LOG_ERROR("pthread_mutex_unlock failed in check_rate_limit");
         }
@@ -1870,272 +1893,202 @@ static void free_nonce_table(void) {
 
 /* Main request handler */
 /**
- * answer_to_connection - MHD request handler
- * @cls: AppContext pointer
- * @connection: MHD connection
- * @url: Request URL
- * @method: HTTP method
- * @version: HTTP version
- * @upload_data: Upload data
- * @upload_data_size: Size of upload data
- * @con_cls: Connection context
+ * answer_to_connection - CivetWeb request handler
+ * @conn: CivetWeb connection
+ * @cbdata: AppContext pointer
  *
  * Handles rate limit, auth, POST processing, validation, response.
- * Returns MHD_YES/MHD_NO.
+ * Returns 1 to indicate request was handled.
  */
-static int answer_to_connection(void *cls, struct MHD_Connection *connection, const char *url,
-                                const char *method, const char *version, const char *upload_data,
-                                size_t *upload_data_size, void **con_cls) {
-    AppContext *ctx = (AppContext *)cls;
-    if (!ctx || !connection || !url || !method) {
-        LOG_ERROR("NULL ctx, connection, url, or method in answer_to_connection");
-        return MHD_NO;
+static int answer_to_connection(struct mg_connection *conn, void *cbdata) {
+    AppContext *ctx = (AppContext *)cbdata;
+    if (!ctx || !conn) {
+        LOG_ERROR("NULL ctx or conn in answer_to_connection");
+        return 1;
     }
-    if (*con_cls == NULL) {
-        struct connection_info_struct *con_info = calloc(1, sizeof(struct connection_info_struct));
-        if (!con_info) {
-            LOG_ERROR("Memory allocation failed for connection_info_struct");
-            return MHD_NO;
-        }
-        const union MHD_ConnectionInfo *ci = MHD_get_connection_info(connection, MHD_CONNECTION_INFO_CLIENT_ADDRESS);
-        if (ci && ci->client_addr) {
-            const struct sockaddr *sa = ci->client_addr;
-            if (sa->sa_family == AF_INET) {
-                const struct sockaddr_in *sa_in = (const struct sockaddr_in *)sa;
-                if (inet_ntop(AF_INET, &(sa_in->sin_addr), con_info->client_ip, INET_ADDRSTRLEN) == NULL) {
-                    perror("[ERROR] inet_ntop for IPv4");
-                    con_info->client_ip[0] = '\0';
-                }
-            } else if (sa->sa_family == AF_INET6) {
-                const struct sockaddr_in6 *sa_in6 = (const struct sockaddr_in6 *)sa;
-                if (inet_ntop(AF_INET6, &(sa_in6->sin6_addr), con_info->client_ip, INET6_ADDRSTRLEN) == NULL) {
-                    perror("[ERROR] inet_ntop for IPv6");
-                    con_info->client_ip[0] = '\0';
-                }
-            } else {
-                con_info->client_ip[0] = '\0';
-            }
-        } else {
-            con_info->client_ip[0] = '\0';
-        }
-
-        /* Parse API version with robust validation */
-        char api_version[MAX_API_VERSION_LEN + 1];
-        const char *ver_header = MHD_lookup_connection_value(connection, MHD_HEADER_KIND, "X-API-Version");
-        if (!ver_header) ver_header = "1.0"; // default
-
-        if (!parse_api_version(ctx, ver_header, api_version, sizeof(api_version))) {
-            json_t *error_json = json_pack("{s:s}", "error", "Unsupported or invalid API version");
-            if (!error_json) {
-                LOG_ERROR("json_pack failed for API version error");
-                free(con_info);
-                return MHD_NO;
-            }
-            int ret = send_json_response(connection, MHD_HTTP_BAD_REQUEST, error_json);
-            json_decref(error_json);
-            free(con_info);
-            return ret;
-        }
-
-        if (strlen(api_version) >= sizeof(con_info->api_version)) {
-            LOG_ERROR("API version too long for buffer");
-            free(con_info);
-            return MHD_NO;
-        }
-        strncpy(con_info->api_version, api_version, sizeof(con_info->api_version) - 1);
-        con_info->api_version[sizeof(con_info->api_version) - 1] = '\0';
-
-        /* Check Content-Length for POST requests to prevent payload too large and overflow */
-        if (strcmp(method, "POST") == 0) {
-            const char *content_length_str = MHD_lookup_connection_value(connection, MHD_HEADER_KIND, "Content-Length");
-            if (content_length_str) {
-                long long content_length = atoll(content_length_str);
-                if (content_length < 0 || content_length > ctx->MAX_BODY_SIZE) {
-                    json_t *error_json = json_pack("{s:s}", "error", "Payload too large");
-                    if (!error_json) {
-                        LOG_ERROR("json_pack failed for payload error");
-                        free(con_info);
-                        return MHD_NO;
-                    }
-                    int ret = send_json_response(connection, MHD_HTTP_PAYLOAD_TOO_LARGE, error_json);
-                    json_decref(error_json);
-                    free(con_info);
-                    return ret;
-                }
-            }
-            con_info->postprocessor = MHD_create_post_processor(connection, ctx->MAX_BODY_SIZE, &iterate_post, con_info);
-            if (!con_info->postprocessor) {
-                LOG_ERROR("MHD_create_post_processor failed");
-                free(con_info);
-                return MHD_NO;
-            }
-        }
-        *con_cls = con_info;
-        return MHD_YES;
+    
+    // Get request info
+    const struct mg_request_info *req_info = mg_get_request_info(conn);
+    if (!req_info) {
+        LOG_ERROR("Failed to get request info");
+        return 1;
     }
-
-    struct connection_info_struct *con_info = *con_cls;
-
-    if (!check_rate_limit(con_info->client_ip)) {
+    
+    // Create connection info
+    struct connection_info_struct con_info;
+    memset(&con_info, 0, sizeof(con_info));
+    
+    // Get client IP
+    const char *remote_addr = req_info->remote_addr;
+    if (remote_addr) {
+        strncpy(con_info.client_ip, remote_addr, INET6_ADDRSTRLEN - 1);
+        con_info.client_ip[INET6_ADDRSTRLEN - 1] = '\0';
+    } else {
+        con_info.client_ip[0] = '\0';
+    }
+    
+    // Parse API version
+    char api_version[DEFAULT_MAX_API_VERSION_LEN + 1];
+    const char *ver_header = mg_get_header(conn, "X-API-Version");
+    if (!ver_header) ver_header = "1.0"; // default
+    
+    if (!parse_api_version(ctx, ver_header, api_version, sizeof(api_version))) {
+        json_t *error_json = json_pack("{s:s}", "error", "Unsupported or invalid API version");
+        if (!error_json) {
+            LOG_ERROR("json_pack failed for API version error");
+            return 1;
+        }
+        send_json_response(conn, 400, error_json);
+        json_decref(error_json);
+        return 1;
+    }
+    
+    strncpy(con_info.api_version, api_version, sizeof(con_info.api_version) - 1);
+    con_info.api_version[sizeof(con_info.api_version) - 1] = '\0';
+    
+    // Check rate limit
+    if (!check_rate_limit(con_info.client_ip)) {
         json_t *error_json = json_pack("{s:s}", "error", "Rate limit exceeded. Please try again later.");
         if (!error_json) {
             LOG_ERROR("json_pack failed for rate limit error");
-            return MHD_NO;
+            return 1;
         }
-        int ret = send_json_response(connection, MHD_HTTP_TOO_MANY_REQUESTS, error_json);
+        send_json_response(conn, 429, error_json);
         json_decref(error_json);
-        return ret;
+        return 1;
     }
-
-    if (strcmp(method, "POST") == 0 && strcmp(url, "/hello") == 0) {
-        if (!check_oauth_bearer(ctx, connection)) {
+    
+    // Handle POST /hello
+    if (strcmp(req_info->request_method, "POST") == 0 && strcmp(req_info->request_uri, "/hello") == 0) {
+        // Check auth
+        if (!check_oauth_bearer(ctx, conn)) {
             json_t *error_json = json_pack("{s:s}", "error", "Unauthorized. Valid JWT Bearer token required.");
             if (!error_json) {
                 LOG_ERROR("json_pack failed for auth error");
-                return MHD_NO;
+                return 1;
             }
-            int ret = send_json_response(connection, MHD_HTTP_UNAUTHORIZED, error_json);
+            send_json_response(conn, 401, error_json);
             json_decref(error_json);
-            return ret;
+            return 1;
         }
-        if (*upload_data_size != 0) {
-            int post_ret = MHD_post_process(con_info->postprocessor, upload_data, *upload_data_size);
-            if (post_ret == MHD_NO) {
-                // Post processing failed, likely due to size exceeded in iterator
+        
+        // Check Content-Length
+        const char *content_length_str = mg_get_header(conn, "Content-Length");
+        long long content_length = 0;
+        if (content_length_str) {
+            content_length = atoll(content_length_str);
+            if (content_length < 0 || content_length > ctx->MAX_BODY_SIZE) {
                 json_t *error_json = json_pack("{s:s}", "error", "Payload too large");
                 if (!error_json) {
-                    LOG_ERROR("json_pack failed for post process error");
-                    return MHD_NO;
+                    LOG_ERROR("json_pack failed for payload error");
+                    return 1;
                 }
-                int ret = send_json_response(connection, MHD_HTTP_PAYLOAD_TOO_LARGE, error_json);
+                send_json_response(conn, 413, error_json);
                 json_decref(error_json);
-                return ret;
+                return 1;
             }
-            *upload_data_size = 0;
-            return MHD_YES;
         }
-        if (con_info->name_len == 0 || con_info->email_len == 0) {
+        
+        // Read POST data
+        char post_buffer[4096];
+        int data_len = mg_read(conn, post_buffer, sizeof(post_buffer) - 1);
+        if (data_len < 0) {
+            LOG_ERROR("Failed to read POST data");
+            json_t *error_json = json_pack("{s:s}", "error", "Failed to read request body");
+            if (!error_json) return 1;
+            send_json_response(conn, 400, error_json);
+            json_decref(error_json);
+            return 1;
+        }
+        post_buffer[data_len] = '\0';
+        
+        // Parse POST data
+        if (!parse_post_data(ctx, post_buffer, data_len, &con_info)) {
+            json_t *error_json = json_pack("{s:s}", "error", "Failed to parse POST data");
+            if (!error_json) return 1;
+            send_json_response(conn, 400, error_json);
+            json_decref(error_json);
+            return 1;
+        }
+        
+        // Validate fields
+        if (con_info.name_len == 0 || con_info.email_len == 0) {
             json_t *error_json = json_pack("{s:s}", "error", "Missing required fields: name and email");
-            if (!error_json) {
-                LOG_ERROR("json_pack failed for missing fields error");
-                return MHD_NO;
-            }
-            int ret = send_json_response(connection, MHD_HTTP_BAD_REQUEST, error_json);
+            if (!error_json) return 1;
+            send_json_response(conn, 400, error_json);
             json_decref(error_json);
-            return ret;
+            return 1;
         }
-        if (!is_valid_name(ctx, con_info->name) || !is_valid_email(ctx, con_info->email)) {
+        
+        if (!is_valid_name(ctx, con_info.name) || !is_valid_email(ctx, con_info.email)) {
             json_t *error_json = json_pack("{s:s}", "error", "Invalid name or email format");
-            if (!error_json) {
-                LOG_ERROR("json_pack failed for validation error");
-                return MHD_NO;
-            }
-            int ret = send_json_response(connection, MHD_HTTP_BAD_REQUEST, error_json);
+            if (!error_json) return 1;
+            send_json_response(conn, 400, error_json);
             json_decref(error_json);
-            return ret;
+            return 1;
         }
-        if (!save_user(ctx, con_info->name, con_info->email)) {
+        
+        // Save user
+        if (!save_user(ctx, con_info.name, con_info.email)) {
             json_t *error_json = json_pack("{s:s}", "error", "Failed to save user data");
-            if (!error_json) {
-                LOG_ERROR("json_pack failed for save error");
-                return MHD_NO;
-            }
-            int ret = send_json_response(connection, MHD_HTTP_INTERNAL_SERVER_ERROR, error_json);
+            if (!error_json) return 1;
+            send_json_response(conn, 500, error_json);
             json_decref(error_json);
-            return ret;
+            return 1;
         }
+        
         time_t now = time(NULL);
-        printf("[%ld] Request from %s: name=%s, email=%s\n", now, con_info->client_ip, con_info->name, con_info->email);
+        printf("[%ld] Request from %s: name=%s, email=%s\n", now, con_info.client_ip, con_info.name, con_info.email);
+        
+        // Generate response based on API version
         char greeting[256];
-        /* Branch logic based on API version */
-        if (strcmp(con_info->api_version, "1.0") == 0) {
-            // existing behavior
-            if (snprintf(greeting, sizeof(greeting), "Hello, %s <%s>", con_info->name, con_info->email) < 0) {
-                LOG_ERROR("snprintf failed for greeting");
-                return MHD_NO;
-            }
-        } else if (strcmp(con_info->api_version, "1.1") == 0) {
-            // future behavior, e.g., include timestamp
-            time_t now = time(NULL);
-            if (snprintf(greeting, sizeof(greeting), "Hello, %s <%s> at %ld", con_info->name, con_info->email, now) < 0) {
-                LOG_ERROR("snprintf failed for greeting 1.1");
-                return MHD_NO;
-            }
+        if (strcmp(con_info.api_version, "1.0") == 0) {
+            snprintf(greeting, sizeof(greeting), "Hello, %s <%s>", con_info.name, con_info.email);
+        } else if (strcmp(con_info.api_version, "1.1") == 0) {
+            snprintf(greeting, sizeof(greeting), "Hello, %s <%s> at %ld", con_info.name, con_info.email, now);
         } else {
-            // unknown version: reject
             json_t *error_json = json_pack("{s:s}", "error", "Unsupported API version");
-            if (!error_json) {
-                LOG_ERROR("json_pack failed for unsupported version error");
-                return MHD_NO;
-            }
-            int ret = send_json_response(connection, MHD_HTTP_BAD_REQUEST, error_json);
+            if (!error_json) return 1;
+            send_json_response(conn, 400, error_json);
             json_decref(error_json);
-            return ret;
+            return 1;
         }
-        json_t *json_resp = json_pack("{s:s, s:s}", "greeting", greeting, "version", con_info->api_version);
+        
+        json_t *json_resp = json_pack("{s:s, s:s}", "greeting", greeting, "version", con_info.api_version);
         if (!json_resp) {
             LOG_ERROR("json_pack failed for response");
-            return MHD_NO;
+            return 1;
         }
-        int ret = send_json_response(connection, MHD_HTTP_OK, json_resp);
+        send_json_response(conn, 200, json_resp);
         json_decref(json_resp);
-
-        /* Zero sensitive buffers after processing */
-        secure_zero(con_info->name, sizeof(con_info->name));
-        secure_zero(con_info->email, sizeof(con_info->email));
-        con_info->name_len = con_info->email_len = 0;
-
-        return ret;
+        
+        // Zero sensitive buffers
+        secure_zero(con_info.name, sizeof(con_info.name));
+        secure_zero(con_info.email, sizeof(con_info.email));
+        
+        return 1;
     }
-
-    if (strcmp(method, "OPTIONS") == 0) {
-        struct MHD_Response *response = MHD_create_response_from_buffer(0, "", MHD_RESPMEM_PERSISTENT);
-        if (!response) {
-            LOG_ERROR("MHD_create_response_from_buffer failed for OPTIONS");
-            return MHD_NO;
-        }
-        MHD_add_response_header(response, "Access-Control-Allow-Methods", "POST, OPTIONS");
-        MHD_add_response_header(response, "Access-Control-Allow-Headers", "Content-Type, Authorization, X-Nonce, X-API-Version, X-App-Secret, X-App-Token");
-        MHD_add_response_header(response, "Access-Control-Allow-Origin", "https://yourdomain.com");
-        add_security_headers(response);
-        int ret = MHD_queue_response(connection, MHD_HTTP_NO_CONTENT, response);
-        if (ret == MHD_NO) {
-            LOG_ERROR("MHD_queue_response failed for OPTIONS");
-        }
-        MHD_destroy_response(response);
-        return ret;
+    
+    // Handle OPTIONS
+    if (strcmp(req_info->request_method, "OPTIONS") == 0) {
+        mg_printf(conn, "HTTP/1.1 204 No Content\r\n");
+        mg_printf(conn, "Access-Control-Allow-Methods: POST, OPTIONS\r\n");
+        mg_printf(conn, "Access-Control-Allow-Headers: Content-Type, Authorization, X-Nonce, X-API-Version, X-App-Secret, X-App-Token\r\n");
+        mg_printf(conn, "Access-Control-Allow-Origin: https://yourdomain.com\r\n");
+        add_security_headers(conn);
+        mg_printf(conn, "\r\n");
+        return 1;
     }
-
+    
+    // Handle invalid endpoint/method
     json_t *error_json = json_pack("{s:s}", "error", "Invalid endpoint or method");
-    if (!error_json) {
-        LOG_ERROR("json_pack failed for invalid endpoint error");
-        return MHD_NO;
-    }
-    int ret = send_json_response(connection, MHD_HTTP_NOT_FOUND, error_json);
+    if (!error_json) return 1;
+    send_json_response(conn, 404, error_json);
     json_decref(error_json);
-    return ret;
+    return 1;
 }
 
-/* Proper connection cleanup */
-/**
- * request_completed - MHD connection cleanup callback
- * @cls: Unused
- * @connection: MHD connection
- * @con_cls: Connection context to free
- * @toe: Termination reason
- *
- * Frees postprocessor and connection_info_struct.
- */
-static void request_completed(void *cls, struct MHD_Connection *connection, void **con_cls, enum MHD_RequestTerminationCode toe) {
-    struct connection_info_struct *con_info = *con_cls;
-    if (con_info) {
-        if (con_info->postprocessor) {
-            MHD_destroy_post_processor(con_info->postprocessor);
-        }
-        free(con_info);
-        *con_cls = NULL;
-    }
-}
+/* CivetWeb doesn't need explicit connection cleanup for our use case */
 
 int main() {
     AppContext ctx;
@@ -2260,22 +2213,51 @@ int main() {
     }
 #endif
 
-    struct MHD_Daemon *daemon;
-    daemon = MHD_start_daemon(
-        MHD_USE_THREAD_PER_CONNECTION | MHD_USE_SSL,
-        ctx.PORT,
-        NULL, NULL,
-        &answer_to_connection, &ctx,
-        MHD_OPTION_NOTIFY_COMPLETED, request_completed, NULL,
-        MHD_OPTION_HTTPS_MEM_KEY, tls_key_pem,
-        MHD_OPTION_HTTPS_MEM_CERT, tls_cert_pem,
-        MHD_OPTION_END);
-
+    // Write TLS files to disk for CivetWeb (it requires file paths)
+    FILE *key_file = fopen("/tmp/server_key.pem", "w");
+    if (!key_file) {
+        LOG_ERROR("Failed to create temporary key file");
+        free(tls_key_pem);
+        free(tls_cert_pem);
+        free_context(&ctx);
+        return 1;
+    }
+    fwrite(tls_key_pem, 1, strlen(tls_key_pem), key_file);
+    fclose(key_file);
+    
+    FILE *cert_file = fopen("/tmp/server_cert.pem", "w");
+    if (!cert_file) {
+        LOG_ERROR("Failed to create temporary cert file");
+        free(tls_key_pem);
+        free(tls_cert_pem);
+        free_context(&ctx);
+        return 1;
+    }
+    fwrite(tls_cert_pem, 1, strlen(tls_cert_pem), cert_file);
+    fclose(cert_file);
+    
     free(tls_key_pem);
     free(tls_cert_pem);
-
-    if (NULL == daemon) {
-        LOG_ERROR("Failed to start HTTPS server");
+    
+    // Configure CivetWeb options
+    char port_str[32];
+    snprintf(port_str, sizeof(port_str), "%ds", ctx.PORT);  // 's' suffix enables SSL
+    
+    const char *options[] = {
+        "listening_ports", port_str,
+        "ssl_certificate", "/tmp/server_cert.pem",
+        "ssl_private_key", "/tmp/server_key.pem",
+        "num_threads", "50",
+        NULL
+    };
+    
+    struct mg_callbacks callbacks;
+    memset(&callbacks, 0, sizeof(callbacks));
+    callbacks.begin_request = answer_to_connection;
+    
+    struct mg_context *mg_ctx = mg_start(&callbacks, &ctx, options);
+    if (!mg_ctx) {
+        LOG_ERROR("Failed to start HTTPS server with CivetWeb");
         free_context(&ctx);
         return 1;
     }
@@ -2310,9 +2292,7 @@ int main() {
 #endif
     }
 
-    if (MHD_stop_daemon(daemon) != MHD_YES) {
-        LOG_ERROR("MHD_stop_daemon failed");
-    }
+    mg_stop(mg_ctx);
 
     /* Cleanup */
     free_rate_limit_table();
@@ -2371,5 +2351,3 @@ EXAMPLE CONFIG.JSON
 }
 ================================================================================
 */
-
-}

@@ -20,8 +20,8 @@ This project is a secure, production-ready, cross-platform REST API server writt
 
 ```mermaid
 graph LR
-  C[Client] -->|HTTPS| MHD[libmicrohttpd Daemon]
-  MHD --> RL[Per-IP Rate Limiter]
+  C[Client] -->|HTTPS| CW[CivetWeb Server]
+  CW --> RL[Per-IP Rate Limiter]
   RL -->|allowed| AUTH[Auth Gateway]
   RL -->|blocked| ERR429[[429 JSON Error]]
 
@@ -144,18 +144,36 @@ flowchart LR
 
 ## Build
 
-- Linux:  
-  `gcc -o server hello.c -lcurl -lssl -lcrypto -ljansson -pthread`  
-  Note: You may also need `-lmicrohttpd -ljwt` depending on your environment.
-- macOS:  
-  `clang -o server hello.c -lcurl -lssl -lcrypto -ljansson`  
-  Note: You may also need `-lmicrohttpd -ljwt`.
-- Windows:  
-  `cl hello.c /link ws2_32.lib User32.lib Advapi32.lib Crypt32.lib`  
-  or  
-  `x86_64-w64-mingw32-gcc hello.c -o server.exe -lcurl -lssl -lcrypto -ljansson -pthread`
+CivetWeb is now used as the HTTP server library instead of libmicrohttpd. Build in two steps:
 
-Ensure dependencies: `libmicrohttpd`, `jansson`, `libcurl`, `openssl`, `libjwt`, `uthash`.
+### Step 1: Compile CivetWeb
+- Linux/macOS:  
+  ```bash
+  gcc -c civetweb.c -o civetweb.o -DUSE_SSL -DNO_SSL_DL -DOPENSSL_API_3_0 -I. -fPIC
+  ```
+- Windows (MinGW):  
+  ```bash
+  gcc -c civetweb.c -o civetweb.o -DUSE_SSL -DNO_SSL_DL -DOPENSSL_API_3_0 -I.
+  ```
+
+### Step 2: Compile and Link Application
+- Linux:  
+  ```bash
+  gcc -c hello.c -o hello.o -I. -Wno-format-truncation -Wno-deprecated-declarations
+  gcc hello.o civetweb.o -o server -lcurl -lssl -lcrypto -ljansson -ljwt -lpthread -ldl
+  ```
+- macOS:  
+  ```bash
+  clang -c hello.c -o hello.o -I. -Wno-format-truncation -Wno-deprecated-declarations
+  clang hello.o civetweb.o -o server -lcurl -lssl -lcrypto -ljansson -ljwt -lpthread
+  ```
+- Windows (MinGW):  
+  ```bash
+  gcc -c hello.c -o hello.o -I.
+  gcc hello.o civetweb.o -o server.exe -lcurl -lssl -lcrypto -ljansson -ljwt -lpthread -lws2_32
+  ```
+
+Ensure dependencies: `jansson`, `libcurl`, `openssl`, `libjwt`, `uthash` (included), `civetweb` (included).
 
 ## Usage
 
